@@ -4,12 +4,12 @@
 
 This plan tracks the transformation of the ECOSTRESS Collection 2 CMR package into a standalone Collection 3 package, including CMR search, granule downloads, and Cloud-Optimized GeoTIFF (COG) point sampling.
 
-**Status snapshot: 2026-11-09.** The package structure and Collection 3 CMR metadata are in place, but several Collection 2 assumptions remain in point sampling, filename handling, tests, and documentation. Overall, the work is estimated at **about 40% complete toward a production-ready Collection 3 package**. This is a readiness estimate, not a measure of coding effort.
+**Status snapshot: 2026-11-09.** Repository packaging and Collection 3 CMR search are complete, but Collection 3 point-sampling compatibility, full filename auditing, and documentation still need work. Overall, the work is estimated at **about 50% complete toward a production-ready Collection 3 package**. This is a readiness estimate, not a measure of coding effort.
 
 | Phase | Status | Summary |
 |---|---|---|
 | 1. Repository and packaging | Complete | Editable install, wheel contents, package import, and both CLI help commands are verified using the `ECOv003-CMR` mamba environment. |
-| 2. CMR metadata and search | Mostly complete | Search and download use the Collection 3 concept-ID map. Seven product IDs are recorded; verify actual CMR queries and result parsing end to end. |
+| 2. CMR metadata and search | Complete | All seven concept IDs and representative summer 2026 searches were verified against live CMR; Search-After paging and Collection 3 URL parsing are covered. |
 | 3. Filename parsing | Not verified | Filename parsers were carried over. Validate them against real Collection 3 granule names and add focused tests. |
 | 4. Point sampling | Partial | COG sampling logic is carried over, but layer mappings still refer to Collection 2 products that were discontinued. |
 | 5. Examples, documentation, and tests | Partial | Examples and tests exist, but documentation still describes Collection 2 and some tests refer to the old import path. |
@@ -31,7 +31,7 @@ The current repository follows **Option A: a standalone `ECOv003-CMR` package**,
 |---|---|---|
 | `authentication.py` | Reused from Collection 2 | Confirm authentication behavior against Collection 3 download URLs. |
 | `constants.py` | Updated with seven Collection 3 products and concept IDs | Verify IDs against current CMR results and ensure all product-facing APIs use this map. |
-| CMR search | Uses the Collection 3 concept-ID map | Test representative searches, empty results, pagination, and parsed Collection 3 URLs/granules. |
+| CMR search | Uses the Collection 3 concept-ID map and Search-After pagination | Phase 2 live queries, empty results, paging, and Collection 3 URL parsing verified. |
 | Downloads | Defaults to `~/data/ECOSTRESS_v003` and delegates granule opening to `ECOv003-granules` | Validate granule IDs, output paths, and successful opening with real or representative Collection 3 data. |
 | Filename interpreters | Carried over without demonstrated Collection 3 validation | Confirm product, granule ID, and variable parsing on Collection 3 filenames; add tests. |
 | Point sampling | COG sampling engine retained | Replace or remove mappings for discontinued Collection 2 products; validate Collection 3 variables and units. |
@@ -56,10 +56,14 @@ Use the `ECOv003-CMR` mamba environment for project Python work. For shell comma
 
 - [x] Add a Collection 3 concept-ID map and record the lookup results in `ecostress_collection3_concept_ids.csv`.
 - [x] Update CMR search and download validation to derive supported products from `CONCEPT_IDS`.
-- [ ] Verify representative concept IDs and searches against the live CMR API.
-- [ ] Confirm result parsing, granule names, file links, and multi-page search behavior for Collection 3.
+- [x] Verify all seven concept IDs against live CMR collection metadata.
+- [x] Search all seven products using June 1, 2026 acquisitions and confirm file links and parsed granule metadata.
+- [x] Follow CMR Search-After headers for subsequent pages and test empty-result behavior.
+- [x] Add Collection 3 filename parsing regression tests for standard and STARS granules.
 
 The current map covers `L1CT_RAD`, `L2T_LSTE`, `L2T_STARS`, `L3T_ETAUX`, `L3T_JET`, `L4T_ESI`, and `L4T_WUE`. Collection 2 products `L3T_MET`, `L3T_SM`, and `L3T_SEB` were discontinued in Collection 3; do not retain them as Collection 3 search or sampling options unless a supported replacement is verified.
+
+Live CMR validation was kept to summer 2026 acquisitions, per the current Collection 3 availability window. The standard-product and STARS filename layouts differ; the result parser now preserves the exact Collection 3 granule ID and extracts the full variable suffix.
 
 ### Phase 3: Filename Interpreters and Parser Rules
 

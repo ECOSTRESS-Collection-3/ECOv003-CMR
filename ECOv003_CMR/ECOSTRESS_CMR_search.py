@@ -2,10 +2,7 @@ import argparse
 import sys
 from typing import List, Union
 import logging
-import requests
 import pandas as pd
-import json
-import posixpath
 from datetime import date
 from dateutil import parser
 
@@ -29,8 +26,8 @@ def ECOSTRESS_CMR_search(
     Search the CMR API for ECOSTRESS granules and return parsed results.
 
     Args:
-        product: ECOSTRESS product code or list of product codes. Allowed values are:
-            L2T_LSTE, L2T_STARS, L3T_MET, L3T_SM, L3T_SEB, L3T_JET, L4T_ESI, L4T_WUE.
+        product: Collection 3 product code or list of product codes. Allowed values are:
+            L1CT_RAD, L2T_LSTE, L2T_STARS, L3T_ETAUX, L3T_JET, L4T_ESI, L4T_WUE.
         tile: Sentinel-2 tile identifier or list of tile identifiers (for example, "11SLT").
         start_date: Start date as a date object or parsable date string.
         end_date: End date as a date object or parsable date string. Defaults to start_date.

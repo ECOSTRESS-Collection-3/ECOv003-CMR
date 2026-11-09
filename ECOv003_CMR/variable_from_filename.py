@@ -1,4 +1,6 @@
-from .product_name_from_filename import product_name_from_filename
+from posixpath import basename
+
+from .granule_ID_from_filename import granule_ID_from_filename
 
 def variable_from_filename(filename):
     """Extracts the variable name from an ECOSTRESS granule filename.
@@ -9,11 +11,12 @@ def variable_from_filename(filename):
     Returns:
         str: The variable name extracted from the filename.
     """
-    product = product_name_from_filename(filename)
-    
-    if product == "L2T_STARS":
-        variable = "_".join(filename.split(".")[0].split("_")[7:])
-    else:
-        variable = "_".join(filename.split(".")[0].split("_")[9:])
-    
-    return variable
+    filename_base = basename(filename).split(".", 1)[0]
+    granule_ID = str(granule_ID_from_filename(filename))
+
+    if filename_base == granule_ID:
+        return ""
+    if not filename_base.startswith(f"{granule_ID}_"):
+        raise ValueError(f"Filename does not start with the parsed granule ID: {filename}")
+
+    return filename_base[len(granule_ID) + 1:]

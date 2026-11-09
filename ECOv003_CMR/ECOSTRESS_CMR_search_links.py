@@ -15,17 +15,17 @@ def ECOSTRESS_CMR_search_links(
         end_date: Union[date, str],
         CMR_search_URL: str = CMR_SEARCH_URL) -> List[str]:
     """
-    Searches the CMR API for ECOSTRESS granules matching the given parameters and extracts all relevant URLs.
+    Search CMR for matching Collection 3 granules and extract file URLs.
 
     This function constructs a query to the NASA Common Metadata Repository (CMR) API to find 
     ECOSTRESS data granules that intersect with a specified Sentinel-2 tile and fall within a 
-    given date range. It then extracts the URLs of these granules from the API response.
+    given date range. It follows CMR Search-After headers to collect every result page.
 
     Args:
-        concept_ID: The concept ID of the ECOSTRESS collection to search (e.g., 'C2082256699-ECOSTRESS').
-        tile: The Sentinel-2 tile identifier for the area of interest (e.g., '10UEV').
-        start_date: The start date of the search period in YYYY-MM-DD format (e.g., '2023-08-01').
-        end_date: The end date of the search period in YYYY-MM-DD format (e.g., '2023-08-15').
+        concept_ID: The concept ID of the ECOSTRESS Collection 3 collection.
+        tile: The Sentinel-2 tile identifier for the area of interest (e.g., '52NHN').
+        start_date: The start date of the search period in YYYY-MM-DD format (e.g., '2026-06-01').
+        end_date: The end date of the search period in YYYY-MM-DD format (e.g., '2026-08-31').
         CMR_search_URL: The base URL for the CMR search API. Defaults to the constant 
                         CMR_SEARCH_URL defined in constants.py.
 
@@ -40,10 +40,10 @@ def ECOSTRESS_CMR_search_links(
 
     Example:
         >>> links = ECOSTRESS_CMR_search_links(
-        ...     concept_ID='C2082256699-ECOSTRESS', 
-        ...     tile='10UEV', 
-        ...     start_date='2023-08-01', 
-        ...     end_date='2023-08-15'
+        ...     concept_ID='C3998139651-LPCLOUD',
+        ...     tile='52NHN',
+        ...     start_date='2026-06-01',
+        ...     end_date='2026-08-31'
         ... )
         >>> print(links)
     """
@@ -63,25 +63,34 @@ def ECOSTRESS_CMR_search_links(
 
     # Construct the CMR API request URL and parameters
     granule_search_URL = f"{CMR_search_URL}granules.json"
+    page_size = 2000
     params = {
         "concept_id": concept_ID,
         "bounding_box": f"{lon},{lat},{lon},{lat}",  # Point search using the tile's centroid
         "temporal": f"{start_date}T00:00:00Z,{end_date}T23:59:59Z",  # ISO 8601 format for date/time
-        "page_size": 2000  # Retrieve up to 2000 granules per page
+        "page_size": page_size
     }
 
-    # Send the request to the CMR API
-    response = requests.get(granule_search_URL, params=params)
-    response.raise_for_status()  # Raise an exception for HTTP errors (e.g., 404 Not Found)
-
-    # Extract URLs from the JSON response
-    data = response.json()
     URLs = []
-    for entry in data.get('feed', {}).get('entry', []):  # Safely navigate the JSON structure
-        for link in entry.get('links', []):
-            URL = link.get('href')
-            # Filter for URLs that start with "https" and end with specific file extensions
-            if URL and URL.startswith("https") and URL.endswith((".tif", ".json", ".aux.xml", ".jpeg")):  
-                URLs.append(URL)
+    headers = {}
+    previous_search_after = None
+    while True:
+        response = requests.get(granule_search_URL, params=params, headers=headers)
+        response.raise_for_status()
+
+        entries = response.json().get("feed", {}).get("entry", [])
+        for entry in entries:
+            for link in entry.get("links", []):
+                URL = link.get("href")
+                if URL and URL.startswith("https") and URL.endswith((".tif", ".json", ".aux.xml", ".jpeg")):
+                    URLs.append(URL)
+
+        search_after = response.headers.get("CMR-Search-After")
+        if not search_after or not entries:
+            break
+        if search_after == previous_search_after:
+            raise RuntimeError("CMR repeated a Search-After token; stopping pagination")
+        previous_search_after = search_after
+        headers = {"CMR-Search-After": search_after}
 
     return URLs
