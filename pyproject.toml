@@ -16,7 +16,6 @@ classifiers = [
 ]
 dependencies = [
     "colored-logging",
-    "ECOv002-CMR",
     "ECOv003-granules",
     "geopandas",
     "matplotlib<3.11",
