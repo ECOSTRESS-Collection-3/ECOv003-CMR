@@ -12,7 +12,7 @@ NASA Earthdata credentials required. Set up via ~/.netrc or environment variable
 from datetime import date
 import sys
 import pandas as pd
-from ECOv002_CMR import (
+from ECOv003_CMR import (
     ECOSTRESS_CMR_search,
     setup_earthdata_session,
     sample_point_from_url,

@@ -1,7 +1,7 @@
 import geopandas as gpd
 import pandas as pd
 from ECOv002_calval_tables import load_calval_table, load_metadata_ebc_filt
-from ECOv002_CMR import sample_points_over_date_range
+from ECOv003_CMR import sample_points_over_date_range
 
 # Load site metadata
 sites_df = load_metadata_ebc_filt()

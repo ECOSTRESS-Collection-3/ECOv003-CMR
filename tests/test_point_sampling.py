@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch, MagicMock
 
 def test_import_point_sampling():
     """Test that point sampling functions can be imported."""
-    from ECOv002_CMR import (
+    from ECOv003_CMR import (
         setup_earthdata_session,
         sample_point_from_url,
         sample_points_from_geodataframe,
@@ -32,7 +32,7 @@ def test_import_point_sampling():
 
 def test_find_sentinel2_tile():
     """Test Sentinel-2 tile lookup for Los Angeles."""
-    from ECOv002_CMR import find_sentinel2_tile
+    from ECOv003_CMR import find_sentinel2_tile
     
     # Downtown LA should be in tile 11SLT
     tile = find_sentinel2_tile(-118.2437, 34.0522)
@@ -45,7 +45,7 @@ def test_find_sentinel2_tile():
 
 def test_setup_earthdata_session_with_params():
     """Test setting up session with explicit credentials."""
-    from ECOv002_CMR import setup_earthdata_session
+    from ECOv003_CMR import setup_earthdata_session
     
     session = setup_earthdata_session(
         username="testuser",
@@ -58,7 +58,7 @@ def test_setup_earthdata_session_with_params():
 
 def test_setup_earthdata_session_no_auth_optional():
     """Test setting up session without authentication when optional."""
-    from ECOv002_CMR import setup_earthdata_session
+    from ECOv003_CMR import setup_earthdata_session
     
     # Clear environment and mock .netrc to test no-auth scenario
     with patch.dict('os.environ', {}, clear=True):
@@ -69,7 +69,7 @@ def test_setup_earthdata_session_no_auth_optional():
 
 def test_setup_earthdata_session_no_auth_required():
     """Test that missing auth raises error when required."""
-    from ECOv002_CMR import setup_earthdata_session
+    from ECOv003_CMR import setup_earthdata_session
     
     with patch.dict('os.environ', {}, clear=True):
         with patch('pathlib.Path.exists', return_value=False):
@@ -79,7 +79,7 @@ def test_setup_earthdata_session_no_auth_required():
 
 def test_sample_points_from_geodataframe_validation():
     """Test input validation for GeoDataFrame sampling."""
-    from ECOv002_CMR import sample_points_from_geodataframe
+    from ECOv003_CMR import sample_points_from_geodataframe
     
     # Create test GeoDataFrame without CRS
     data = {
@@ -95,7 +95,7 @@ def test_sample_points_from_geodataframe_validation():
 
 def test_sample_points_from_geodataframe_missing_columns():
     """Test error handling for missing required columns."""
-    from ECOv002_CMR import sample_points_from_geodataframe
+    from ECOv003_CMR import sample_points_from_geodataframe
     
     # GeoDataFrame without datetime column
     data = {
@@ -110,7 +110,7 @@ def test_sample_points_from_geodataframe_missing_columns():
 
 def test_sample_points_from_geodataframe_crs_reprojection():
     """Test that non-WGS84 GeoDataFrames are reprojected."""
-    from ECOv002_CMR import sample_points_from_geodataframe
+    from ECOv003_CMR import sample_points_from_geodataframe
     from unittest.mock import patch
     
     # Create GeoDataFrame in Web Mercator (EPSG:3857)
@@ -136,7 +136,7 @@ def test_sample_point_from_url_success():
     # This is a complex integration that's difficult to mock fully.
     # In practice, this would require actual raster data or a test fixture.
     # For now, we just verify the function exists and has correct signature.
-    from ECOv002_CMR import sample_point_from_url
+    from ECOv003_CMR import sample_point_from_url
     import inspect
     
     sig = inspect.signature(sample_point_from_url)
@@ -154,7 +154,7 @@ def test_sample_point_from_url_outside_bounds():
     """Test handling of point outside raster bounds (simplified)."""
     # Similar to above, complex mocking is difficult.
     # This would be better tested with integration tests using real data.
-    from ECOv002_CMR import sample_point_from_url
+    from ECOv003_CMR import sample_point_from_url
     import inspect
     
     # Just verify the function signature and that it returns a tuple

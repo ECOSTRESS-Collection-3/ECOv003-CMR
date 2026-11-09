@@ -16,7 +16,7 @@ import pandas as pd
 import geopandas as gpd
 from datetime import date
 from shapely.geometry import Point
-from ECOv002_CMR import sample_points_over_date_range
+from ECOv003_CMR import sample_points_over_date_range
 
 # Example: Create sample CSV
 sample_data = """site_id,site_name,latitude,longitude

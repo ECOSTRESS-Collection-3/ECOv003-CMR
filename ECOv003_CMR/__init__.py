@@ -1,4 +1,4 @@
-from .ECOv002_CMR import *
+from .ECOv003_CMR import *
 from .version import __version__
 from .authentication import setup_earthdata_session
 from .point_sampling import (

@@ -1,6 +1,6 @@
 """Debug script to see what STARS granules are found."""
 import pandas as pd
-from ECOv002_CMR import ECOSTRESS_CMR_search
+from ECOv003_CMR import ECOSTRESS_CMR_search
 
 # Search for STARS products in the same date range
 tile = "18SUE"

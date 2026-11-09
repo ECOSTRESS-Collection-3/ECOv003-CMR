@@ -1,6 +1,6 @@
 """Debug why LST sampling failed for June 8."""
 import requests
-from ECOv002_CMR import setup_earthdata_session, ECOSTRESS_CMR_search
+from ECOv003_CMR import setup_earthdata_session, ECOSTRESS_CMR_search
 
 session = setup_earthdata_session()
 

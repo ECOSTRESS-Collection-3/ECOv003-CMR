@@ -13,7 +13,7 @@ NASA Earthdata credentials required. Set up via ~/.netrc or environment variable
 import geopandas as gpd
 from datetime import date
 from shapely.geometry import Point
-from ECOv002_CMR import sample_points_over_date_range
+from ECOv003_CMR import sample_points_over_date_range
 
 # Create sample points across different locations in Los Angeles area
 data = {
