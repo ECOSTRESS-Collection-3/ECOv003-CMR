@@ -6,7 +6,7 @@ import logging
 
 import pandas as pd
 
-from ECOv002_granules import ECOSTRESSGranule
+from ECOv003_granules import ECOSTRESSGranule
 
 from .constants import *
 from .granule_ID import GranuleID

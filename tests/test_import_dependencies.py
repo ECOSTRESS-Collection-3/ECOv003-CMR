@@ -3,7 +3,6 @@ import pytest
 # List of dependencies
 dependencies = [
     "colored_logging",
-    "ECOv002_granules",
     "numpy",
     "pandas",
     "rasters",

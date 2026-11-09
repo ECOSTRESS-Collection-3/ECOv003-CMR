@@ -6,7 +6,7 @@ from datetime import date
 import posixpath
 import pandas as pd
 
-from ECOv002_granules import ECOSTRESSGranule, open_granule
+from ECOv003_granules import ECOSTRESSGranule, open_granule
 
 from .constants import *
 from .granule_ID import GranuleID

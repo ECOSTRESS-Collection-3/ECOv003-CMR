@@ -3,9 +3,9 @@ requires = ["setuptools>=60", "setuptools-scm>=8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ECOv002-CMR"
-version = "1.4.1"
-description = "Common Metadata Repository (CMR) Search for ECOSTRESS Collection 2"
+name = "ECOv003-CMR"
+version = "0.1.0"
+description = "Common Metadata Repository (CMR) Search for ECOSTRESS Collection 3"
 readme = "README.md"
 authors = [
     { name = "Gregory H. Halverson", email = "gregory.h.halverson@jpl.nasa.gov" },
@@ -16,7 +16,8 @@ classifiers = [
 ]
 dependencies = [
     "colored-logging",
-    "ECOv002-granules",
+    "ECOv002-CMR",
+    "ECOv003-granules",
     "geopandas",
     "matplotlib<3.11",
     "numpy",
@@ -42,12 +43,12 @@ dev = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/ECOSTRESS-Collection-2/ECOv002-CMR"
+"Homepage" = "https://github.com/ECOSTRESS-Collection-3/ECOv003-CMR"
 
 [project.scripts]
-ECOv002-search = "ECOv002_CMR.ECOSTRESS_CMR_search:main"
-ECOv002-download = "ECOv002_CMR.download_ECOSTRESS:main"
+ECOv003-search = "ECOv003_CMR.ECOSTRESS_CMR_search:main"
+ECOv003-download = "ECOv003_CMR.download_ECOSTRESS:main"
 
 [tool.setuptools.packages.find]
-include = ["ECOv002_CMR"]
+include = ["ECOv003_CMR"]
 exclude = ["data", "build", "tests"]
