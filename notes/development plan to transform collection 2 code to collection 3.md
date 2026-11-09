@@ -8,7 +8,7 @@ This plan tracks the transformation of the ECOSTRESS Collection 2 CMR package in
 
 | Phase | Status | Summary |
 |---|---|---|
-| 1. Repository and packaging | Mostly complete | Standalone package builds and installs editable; wheel contents and console-script metadata are verified. Run the CLI commands in a dependency-complete environment. |
+| 1. Repository and packaging | Complete | Editable install, wheel contents, package import, and both CLI help commands are verified using the `ECOv003-CMR` mamba environment. |
 | 2. CMR metadata and search | Mostly complete | Search and download use the Collection 3 concept-ID map. Seven product IDs are recorded; verify actual CMR queries and result parsing end to end. |
 | 3. Filename parsing | Not verified | Filename parsers were carried over. Validate them against real Collection 3 granule names and add focused tests. |
 | 4. Point sampling | Partial | COG sampling logic is carried over, but layer mappings still refer to Collection 2 products that were discontinued. |
@@ -35,7 +35,7 @@ The current repository follows **Option A: a standalone `ECOv003-CMR` package**,
 | Downloads | Defaults to `~/data/ECOSTRESS_v003` and delegates granule opening to `ECOv003-granules` | Validate granule IDs, output paths, and successful opening with real or representative Collection 3 data. |
 | Filename interpreters | Carried over without demonstrated Collection 3 validation | Confirm product, granule ID, and variable parsing on Collection 3 filenames; add tests. |
 | Point sampling | COG sampling engine retained | Replace or remove mappings for discontinued Collection 2 products; validate Collection 3 variables and units. |
-| Packaging | Project name, version lookup, editable install, wheel build, and CLI entry-point metadata are verified for Collection 3 | Run both CLI commands in a dependency-complete environment and verify a clean install with runtime dependencies. |
+| Packaging | Project name, version lookup, editable install, wheel build, package import, and CLI commands are verified for Collection 3 | No remaining Phase 1 work. |
 | Docs and examples | Existing content is largely Collection 2-era | Update package names, supported products, filenames, layers, and examples to Collection 3. |
 
 ## 4. Phase-by-Phase Plan
@@ -47,7 +47,10 @@ The current repository follows **Option A: a standalone `ECOv003-CMR` package**,
 - [x] Set the Collection 3 default download directory.
 - [x] Fix the package metadata lookup in `ECOv003_CMR/version.py` so it uses the `ECOv003-CMR` distribution.
 - [x] Verify editable installation, built wheel contents, and registered CLI entry-point targets.
-- [ ] Run both CLI commands and verify a clean install in an environment with runtime dependencies installed.
+- [x] Run both CLI `--help` commands in the `ECOv003-CMR` mamba environment.
+- [x] Reinstall from the current checkout and verify package import and both CLI commands in the `ECOv003-CMR` mamba environment.
+
+Use the `ECOv003-CMR` mamba environment for project Python work. For shell commands, invoke it explicitly with `mamba run -n ECOv003-CMR ...`; the VS Code workspace interpreter is configured to the same environment.
 
 ### Phase 2: CMR Metadata and Search
 
