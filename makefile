@@ -1,0 +1,69 @@
+# Define the default Python version as a constant
+PYTHON_VERSION = 3.13
+
+.PHONY: dist
+
+PACKAGE_NAME = ECOv003-CMR
+ENVIRONMENT_NAME = $(PACKAGE_NAME)
+DOCKER_IMAGE_NAME = $(PACKAGE_NAME)
+
+clean:
+	rm -rf *.o *.out *.log
+	rm -rf build/
+	rm -rf dist/
+	rm -rf *.egg-info
+	rm -rf .pytest_cache
+	find . -type d -name "__pycache__" -exec rm -rf {} +
+
+test:
+	pytest tests
+
+test-integration:
+	pytest test_drop_na.py test_parallel_performance.py
+
+build:
+	python -m build
+
+twine-upload:
+	twine upload dist/*
+
+dist:
+	make clean
+	make build
+	make twine-upload
+
+remove-environment:
+	mamba env remove -y -n $(ENVIRONMENT_NAME)
+
+install:
+	pip install -e .[dev]
+
+uninstall:
+	pip uninstall $(PACKAGE_NAME)
+
+reinstall:
+	make uninstall
+	make install
+
+environment:
+	mamba create -y -n $(ENVIRONMENT_NAME) -c conda-forge python=$(PYTHON_VERSION)
+	@echo "Python version set to $(PYTHON_VERSION)"
+	@source activate $(ENVIRONMENT_NAME) && python --version
+
+colima-start:
+	colima start -m 16 -a x86_64 -d 100 
+
+docker-build:
+	docker build -t $(DOCKER_IMAGE_NAME):latest .
+
+docker-build-environment:
+	docker build --target environment -t $(DOCKER_IMAGE_NAME):latest .
+
+docker-build-installation:
+	docker build --target installation -t $(DOCKER_IMAGE_NAME):latest .
+
+docker-interactive:
+	docker run -it $(DOCKER_IMAGE_NAME) fish 
+
+docker-remove:
+	docker rmi -f $(DOCKER_IMAGE_NAME)
