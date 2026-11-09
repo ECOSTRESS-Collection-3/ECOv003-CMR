@@ -4,13 +4,13 @@
 
 This plan tracks the transformation of the ECOSTRESS Collection 2 CMR package into a standalone Collection 3 package, including CMR search, granule downloads, and Cloud-Optimized GeoTIFF (COG) point sampling.
 
-**Status snapshot: 2026-11-09.** Repository packaging and Collection 3 CMR search are complete, but Collection 3 point-sampling compatibility, full filename auditing, and documentation still need work. Overall, the work is estimated at **about 50% complete toward a production-ready Collection 3 package**. This is a readiness estimate, not a measure of coding effort.
+**Status snapshot: 2026-11-09.** Repository packaging and Collection 3 CMR search are complete. Collection 3 filenames now have parser tests for all seven products, but compatibility with the downstream granule package is blocked. Point-sampling compatibility and documentation still need work. Overall readiness remains **about 50%** because download/open integration is not yet reliable.
 
 | Phase | Status | Summary |
 |---|---|---|
 | 1. Repository and packaging | Complete | Editable install, wheel contents, package import, and both CLI help commands are verified using the `ECOv003-CMR` mamba environment. |
 | 2. CMR metadata and search | Complete | All seven concept IDs and representative summer 2026 searches were verified against live CMR; Search-After paging and Collection 3 URL parsing are covered. |
-| 3. Filename parsing | Not verified | Filename parsers were carried over. Validate them against real Collection 3 granule names and add focused tests. |
+| 3. Filename parsing | Parser tests complete; downstream integration blocked | All seven CMR filename patterns are tested, and the download wrapper now rejects unrecognized or misparsed granules instead of returning invalid objects. The installed `ECOv003-granules` dispatcher and metadata parsing still need correction. |
 | 4. Point sampling | Partial | COG sampling logic is carried over, but layer mappings still refer to Collection 2 products that were discontinued. |
 | 5. Examples, documentation, and tests | Partial | Examples and tests exist, but documentation still describes Collection 2 and some tests refer to the old import path. |
 
@@ -32,8 +32,8 @@ The current repository follows **Option A: a standalone `ECOv003-CMR` package**,
 | `authentication.py` | Reused from Collection 2 | Confirm authentication behavior against Collection 3 download URLs. |
 | `constants.py` | Updated with seven Collection 3 products and concept IDs | Verify IDs against current CMR results and ensure all product-facing APIs use this map. |
 | CMR search | Uses the Collection 3 concept-ID map and Search-After pagination | Phase 2 live queries, empty results, paging, and Collection 3 URL parsing verified. |
-| Downloads | Defaults to `~/data/ECOSTRESS_v003` and delegates granule opening to `ECOv003-granules` | Validate granule IDs, output paths, and successful opening with real or representative Collection 3 data. |
-| Filename interpreters | Carried over without demonstrated Collection 3 validation | Confirm product, granule ID, and variable parsing on Collection 3 filenames; add tests. |
+| Downloads | Defaults to `~/data/ECOSTRESS_v003`; validates granule objects returned by `ECOv003-granules` | Resolve dependency incompatibility and verify the full Collection 3 download/open flow. |
+| Filename interpreters | Validated against June 2026 CMR names for all seven products | Resolve downstream `ECOv003-granules` compatibility before declaring end-to-end parsing/download support. |
 | Point sampling | COG sampling engine retained | Replace or remove mappings for discontinued Collection 2 products; validate Collection 3 variables and units. |
 | Packaging | Project name, version lookup, editable install, wheel build, package import, and CLI commands are verified for Collection 3 | No remaining Phase 1 work. |
 | Docs and examples | Existing content is largely Collection 2-era | Update package names, supported products, filenames, layers, and examples to Collection 3. |
@@ -67,12 +67,14 @@ Live CMR validation was kept to summer 2026 acquisitions, per the current Collec
 
 ### Phase 3: Filename Interpreters and Parser Rules
 
-- [ ] Collect representative Collection 3 filenames across supported products and file variables.
-- [ ] Audit `product_name_from_filename.py`, `granule_ID_from_filename.py`, and `variable_from_filename.py` against those names.
-- [ ] Add focused tests for product, granule ID, and variable parsing, including edge cases.
-- [ ] Confirm parsed granule IDs are accepted by `ECOv003-granules` and the download workflow.
+- [x] Collect representative Collection 3 filenames from June 2026 CMR results for all seven supported products.
+- [x] Audit `product_name_from_filename.py`, `granule_ID_from_filename.py`, and `variable_from_filename.py` against those names.
+- [x] Add focused tests for product, granule ID, and variable parsing, including STARS, underscore-containing variable names, Collection 2 compatibility, and JPEG auxiliary XML.
+- [x] Verify local `GranuleID` values used by the download-listing workflow for Collection 3 product names.
+- [x] Make the download wrapper report when the granule package fails to recognize or correctly parse a product.
+- [ ] Resolve and retest downstream `ECOv003-granules` compatibility before completing Phase 3.
 
-Do not assume Collection 2 filename positions or prefixes are valid for Collection 3 solely because the parser code is reusable.
+**External dependency blocker:** The `ECOv003-granules` 1.13.2 dispatcher returns `None` for live CMR `ECOv003_L1CT_RAD` and `ECOv003_L3T_ETAUX` names (it checks an `L1CT_RED` prefix and has no ETAUX branch). For several other products it dispatches to a granule class, but inherited `product`, `orbit`, and `scene` properties parse Collection 3 filenames using the wrong field positions. The download wrapper therefore cannot yet guarantee a valid granule object for all products. Fix or upgrade that dependency, then verify the download/open flow with Collection 3 granules before marking Phase 3 complete.
 
 ### Phase 4: Point Sampling
 
@@ -108,5 +110,7 @@ Preserve the current no-full-download COG sampling approach unless Collection 3 
 > **Product differences:** Collection 3 does not include the Collection 2 `L3T_MET`, `L3T_SM`, and `L3T_SEB` products. Sampling mappings and user documentation must reflect supported Collection 3 products rather than assuming a direct name-for-name migration.
 
 > **Filename compatibility:** Parsers were reused without Collection 3-specific regression evidence. A successful CMR query alone does not establish that granule and variable parsing or downstream downloads work.
+
+> **Granule package compatibility:** `ECOv003-granules` must recognize current CMR product prefixes and parse Collection 3 granule metadata correctly; current local evidence shows it does not for the supported catalog.
 
 > **Release readiness:** A passing import test is insufficient. Verify clean installation, CLI behavior, live or fixture-backed search, download/open flow, and point sampling before publishing.

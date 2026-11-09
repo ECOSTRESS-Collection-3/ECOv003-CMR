@@ -51,5 +51,16 @@ def download_ECOSTRESS_granule(
     )
 
     granule = open_granule(directory)
+    if not isinstance(granule, ECOSTRESSGranule):
+        raise RuntimeError(
+            f"ECOv003-granules could not open Collection 3 granule: {directory}"
+        )
+
+    expected_product = GranuleID(posixpath.basename(directory)).product
+    if granule.product != expected_product:
+        raise RuntimeError(
+            f"ECOv003-granules parsed product {granule.product!r} from {directory}, "
+            f"expected {expected_product!r}; update ECOv003-granules for Collection 3 filenames"
+        )
 
     return granule

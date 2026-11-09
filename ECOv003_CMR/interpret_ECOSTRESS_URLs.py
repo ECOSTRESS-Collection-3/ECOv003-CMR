@@ -58,10 +58,10 @@ def interpret_ECOSTRESS_URLs(
             type = "JSON Metadata"
         elif filename.endswith(".tif"):
             type = "GeoTIFF Data"
-        elif filename.endswith(".jpeg"):
-            type = "GeoJPEG Preview"
         elif filename.endswith(".jpeg.aux.xml"):
             type = "GeoJPEG Metadata"
+        elif filename.endswith(".jpeg"):
+            type = "GeoJPEG Preview"
         else:
             raise ValueError(f"Unknown file type for {filename}")
 
