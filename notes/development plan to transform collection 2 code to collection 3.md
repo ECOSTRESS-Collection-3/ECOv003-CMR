@@ -8,7 +8,7 @@ This plan tracks the transformation of the ECOSTRESS Collection 2 CMR package in
 
 | Phase | Status | Summary |
 |---|---|---|
-| 1. Repository and packaging | Mostly complete | Standalone `ECOv003-CMR` package, CLI entry points, and Collection 3 download directory are configured. Fix the stale distribution lookup in `version.py`. |
+| 1. Repository and packaging | Mostly complete | Standalone package builds and installs editable; wheel contents and console-script metadata are verified. Run the CLI commands in a dependency-complete environment. |
 | 2. CMR metadata and search | Mostly complete | Search and download use the Collection 3 concept-ID map. Seven product IDs are recorded; verify actual CMR queries and result parsing end to end. |
 | 3. Filename parsing | Not verified | Filename parsers were carried over. Validate them against real Collection 3 granule names and add focused tests. |
 | 4. Point sampling | Partial | COG sampling logic is carried over, but layer mappings still refer to Collection 2 products that were discontinued. |
@@ -35,7 +35,7 @@ The current repository follows **Option A: a standalone `ECOv003-CMR` package**,
 | Downloads | Defaults to `~/data/ECOSTRESS_v003` and delegates granule opening to `ECOv003-granules` | Validate granule IDs, output paths, and successful opening with real or representative Collection 3 data. |
 | Filename interpreters | Carried over without demonstrated Collection 3 validation | Confirm product, granule ID, and variable parsing on Collection 3 filenames; add tests. |
 | Point sampling | COG sampling engine retained | Replace or remove mappings for discontinued Collection 2 products; validate Collection 3 variables and units. |
-| Packaging | Project name and CLI entry points are set to Collection 3 | Update `version.py`, which currently looks up `ECOv002-CMR` metadata; verify clean install and both CLI commands. |
+| Packaging | Project name, version lookup, editable install, wheel build, and CLI entry-point metadata are verified for Collection 3 | Run both CLI commands in a dependency-complete environment and verify a clean install with runtime dependencies. |
 | Docs and examples | Existing content is largely Collection 2-era | Update package names, supported products, filenames, layers, and examples to Collection 3. |
 
 ## 4. Phase-by-Phase Plan
@@ -45,8 +45,9 @@ The current repository follows **Option A: a standalone `ECOv003-CMR` package**,
 - [x] Establish the `ECOv003_CMR/`, `examples/`, and `tests/` structure.
 - [x] Set project metadata, dependencies, and `ECOv003-search` / `ECOv003-download` entry points in `pyproject.toml`.
 - [x] Set the Collection 3 default download directory.
-- [ ] Fix the package metadata lookup in `ECOv003_CMR/version.py` so it uses the `ECOv003-CMR` distribution.
-- [ ] Verify editable installation, built distribution contents, and both CLI entry points from a clean environment.
+- [x] Fix the package metadata lookup in `ECOv003_CMR/version.py` so it uses the `ECOv003-CMR` distribution.
+- [x] Verify editable installation, built wheel contents, and registered CLI entry-point targets.
+- [ ] Run both CLI commands and verify a clean install in an environment with runtime dependencies installed.
 
 ### Phase 2: CMR Metadata and Search
 
