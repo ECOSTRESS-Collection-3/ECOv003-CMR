@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Demonstration of point sampling from ECOSTRESS Collection 2 data.
+Demonstration of point sampling from ECOSTRESS Collection 3 data.
 
 This script samples Land Surface Temperature (LSTE) at a specific coordinate
 for all available granules that contain that point.
@@ -26,8 +26,8 @@ PRODUCTS = {
     "L2T_LSTE": "LST",      # Land Surface Temperature
     "L2T_STARS": ["NDVI", "albedo"]  # NDVI and Albedo from STARS (tiled)
 }
-START_DATE = date(2025, 6, 1)
-END_DATE = date(2025, 6, 30)
+START_DATE = date(2026, 6, 1)
+END_DATE = date(2026, 6, 30)
 
 print("=" * 80)
 print("ECOSTRESS POINT SAMPLING DEMONSTRATION")
@@ -108,8 +108,8 @@ for granule in unique_granules:
     
     # Extract orbit, scene, timestamp from granule name
     # Different formats for different products:
-    # L2T_LSTE: ECOv002_L2T_LSTE_<orbit>_<scene>_<tile>_<timestamp>_<version>_<build>
-    # L2T_STARS: ECOv002_L2T_STARS_<tile>_<date>_<version>_<build>
+    # L2T_LSTE: ECOv003_L2T_LSTE_<orbit>_<scene>_<tile>_<timestamp>_<build>
+    # L2T_STARS: ECOv003_L2T_STARS_<tile>_<date>_<build>
     parts = granule.split('_')
     product = "_".join(parts[1:3])  # Extract product name (e.g., "L2T_LSTE" or "L2T_STARS")
     

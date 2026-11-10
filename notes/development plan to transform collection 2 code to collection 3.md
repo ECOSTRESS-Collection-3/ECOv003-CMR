@@ -4,15 +4,15 @@
 
 This plan tracks the transformation of the ECOSTRESS Collection 2 CMR package into a standalone Collection 3 package, including CMR search, granule downloads, and Cloud-Optimized GeoTIFF (COG) point sampling.
 
-**Status snapshot: 2026-11-09.** Repository packaging, CMR search, and Collection 3 filename/download-directory parsing are complete. A local compatibility adapter covers all seven Collection 3 product names while reusing `ECOv003-granules` classes where available. Point-sampling compatibility and documentation still need work. Overall readiness is estimated at **about 60%**.
+**Status snapshot: 2026-11-09.** Repository packaging, CMR search, Collection 3 filename/download-directory parsing, point-sampling compatibility, and the documentation/examples migration are complete. A local compatibility adapter covers all seven Collection 3 product names while reusing `ECOv003-granules` classes where available. Authenticated end-to-end download and sampling remain pre-release checks. Overall readiness is estimated at **about 90%**.
 
 | Phase | Status | Summary |
 |---|---|---|
 | 1. Repository and packaging | Complete | Editable install, wheel contents, package import, and both CLI help commands are verified using the `ECOv003-CMR` mamba environment. |
 | 2. CMR metadata and search | Complete | All seven concept IDs and representative summer 2026 searches were verified against live CMR; Search-After paging and Collection 3 URL parsing are covered. |
 | 3. Filename parsing | Complete | All seven Collection 3 product layouts are tested; a compatibility adapter handles product dispatch, granule metadata, and file discovery for downloaded directories. |
-| 4. Point sampling | Partial | COG sampling logic is carried over, but layer mappings still refer to Collection 2 products that were discontinued. |
-| 5. Examples, documentation, and tests | Partial | Collection 3 search, parser, and download-adapter regression tests pass. README, integration notes, and examples still need Collection 3 updates. |
+| 4. Point sampling | Complete | Layer mappings now use verified Collection 3 variables and `L3T_ETAUX`; COG values, temperature conversion, and nodata handling are fixture-tested. |
+| 5. Examples, documentation, and tests | Complete | README, integration notes, and all point-sampling examples now describe Collection 3; import tests target `ECOv003_CMR`, and the complete test suite passes. |
 
 ## 2. Architecture Decision
 
@@ -34,9 +34,9 @@ The current repository follows **Option A: a standalone `ECOv003-CMR` package**,
 | CMR search | Uses the Collection 3 concept-ID map and Search-After pagination | Phase 2 live queries, empty results, paging, and Collection 3 URL parsing verified. |
 | Downloads | Defaults to `~/data/ECOSTRESS_v003`; uses the Collection 3 compatibility adapter and validates parsed product metadata | Verify a real authenticated Collection 3 download/open workflow before release. |
 | Filename interpreters | Validated against June 2026 CMR names for all seven products | No remaining Phase 3 work. |
-| Point sampling | COG sampling engine retained | Replace or remove mappings for discontinued Collection 2 products; validate Collection 3 variables and units. |
+| Point sampling | COG range reads and batch sampling are covered by Collection 3 fixtures | Mappings use current L2T layers and `L3T_ETAUX`; temperature conversion and nodata handling are tested. Authenticated real-data sampling remains a release check. |
 | Packaging | Project name, version lookup, editable install, wheel build, package import, and CLI commands are verified for Collection 3 | No remaining Phase 1 work. |
-| Docs and examples | Existing content is largely Collection 2-era | Update package names, supported products, filenames, layers, and examples to Collection 3. |
+| Docs and examples | README, point-sampling integration notes, and examples describe Collection 3 | No remaining Phase 5 work. |
 
 ## 4. Phase-by-Phase Plan
 
@@ -81,29 +81,27 @@ Live CMR validation was kept to summer 2026 acquisitions, per the current Collec
 ### Phase 4: Point Sampling
 
 - [x] Retain the existing COG range-read and batch-sampling implementation as the starting point.
-- [ ] Audit `LAYER_MAPPING` against Collection 3 product availability, variable names, and units.
-- [ ] Remove or replace mappings to discontinued `L3T_MET` and `L3T_SM` products. Identify valid Collection 3 replacements, if any, before exposing those layers.
-- [ ] Verify the default `L2T_LSTE` / `L2T_STARS` layers against Collection 3 files, including temperature conversion and nodata handling.
-- [ ] Add tests for supported mappings and rejection of unsupported layers/products.
-- [ ] Run point-sampling examples against Collection 3 data or stable fixtures.
+- [x] Audit `LAYER_MAPPING` against live Collection 3 product availability and variable names; use catalog units for the mapped variables.
+- [x] Replace discontinued `L3T_MET` and `L3T_SM` mappings with `L3T_ETAUX` variables (`Ta`, `RH`, and `SM`); also expose verified radiation and mask layers.
+- [x] Verify default `L2T_LSTE` / `L2T_STARS` layers, including Kelvin-to-Celsius conversion and NaN nodata handling, using Collection 3 fixtures.
+- [x] Add tests for supported mappings and explicit rejection of removed Collection 2 layers.
+- [x] Exercise point-sampling flows against mocked June 2026 CMR results and stable in-memory COG fixtures.
 
-Preserve the current no-full-download COG sampling approach unless Collection 3 validation demonstrates a specific incompatibility.
+Live June 1, 2026 CMR results confirm the L2T and ETAUX variable names used by `LAYER_MAPPING`. The LP DAAC catalog describes ETAUX `Ta` in Celsius, `RH` and `SM` as ratios, and `Rg`/`Rn` in W/m². Collection 3 STARS results do not include the old `EVI` or `SAVI` layers; unsupported requests now raise an error instead of being silently skipped. The no-full-download COG range-read approach is retained.
 
 ### Phase 5: Examples, Documentation, and Tests
 
-- [ ] Update `README.md` installation instructions, imports, product list, and API examples to `ECOv003-CMR`.
-- [ ] Update `POINT_SAMPLING_INTEGRATION.md` and `examples/README.md` to describe Collection 3.
-- [ ] Check each example's product names, layer mappings, filename assumptions, and import paths.
-- [ ] Replace stale `ECOv002_CMR` test patch targets and rename tests that still imply the old package.
+- [x] Update `README.md` installation instructions, imports, supported product list, CLI commands, and current API examples to `ECOv003-CMR`.
+- [x] Update `POINT_SAMPLING_INTEGRATION.md` and `examples/README.md` to describe Collection 3 sampling, variables, units, and authentication.
+- [x] Check point-sampling examples' product names, layer mappings, filename assumptions, dates, and import paths.
+- [x] Rename the package import smoke test to `test_import_ECOv003_CMR.py`; no stale Collection 2 patch targets remain.
 - [x] Add mock-based CMR search/download-adapter tests and Collection 3 filename/parser regressions.
-- [x] Run the complete test suite in the `ECOv003-CMR` mamba environment (36 passed).
+- [x] Run the complete test suite in the `ECOv003-CMR` mamba environment (43 passed).
 
 ## 5. Immediate Priorities
 
-1. Correct the package version lookup and verify import from a clean Collection 3 installation.
-2. Resolve stale point-sampling mappings against the actual Collection 3 catalog.
-3. Validate point-sampling layers and behavior against Collection 3 files.
-4. Update tests and docs, then run CI and end-to-end search/sampling checks.
+1. Perform authenticated Collection 3 download/open and point-sampling checks before release.
+2. Run CI in the release environment.
 
 ## 6. Risks and Decision Points
 

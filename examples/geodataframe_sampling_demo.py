@@ -37,8 +37,8 @@ print(f"\nSampling {len(gdf)} points:\n")
 print(gdf[['site_id', 'site_name']].to_string(index=False))
 
 # Define date range
-start_date = date(2025, 6, 1)
-end_date = date(2025, 6, 30)
+start_date = date(2026, 6, 1)
+end_date = date(2026, 6, 30)
 
 print(f"\nSearching for all ECOSTRESS acquisitions from {start_date} to {end_date}")
 print("Using default layers: ST_C (Surface Temp in Celsius), NDVI, albedo")

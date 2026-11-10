@@ -1,5 +1,5 @@
 """
-Point sampling from ECOSTRESS Collection 2 data.
+Point sampling from ECOSTRESS Collection 3 data.
 
 This module provides functions for sampling ECOSTRESS raster data at specific
 geographic points, supporting both single-point queries and batch processing
@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
 import pandas as pd
+import numpy as np
 try:
     from tqdm import tqdm
     HAS_TQDM = True
@@ -34,7 +35,7 @@ from .authentication import setup_earthdata_session
 
 logger = logging.getLogger(__name__)
 
-# Layer name to (product, variable) mapping
+# Layer name to (Collection 3 product, variable) mapping
 LAYER_MAPPING = {
     'ST_C': ('L2T_LSTE', 'LST'),           # Surface Temperature in Celsius (converted from Kelvin)
     'LST': ('L2T_LSTE', 'LST'),            # Land Surface Temperature (Kelvin)
@@ -43,16 +44,47 @@ LAYER_MAPPING = {
     'emissivity': ('L2T_LSTE', 'EmisWB'),  # Wideband emissivity (alias for EmisWB)
     'EmisWB': ('L2T_LSTE', 'EmisWB'),      # Wideband emissivity
     'NDVI': ('L2T_STARS', 'NDVI'),         # Normalized Difference Vegetation Index
-    'EVI': ('L2T_STARS', 'EVI'),           # Enhanced Vegetation Index
     'albedo': ('L2T_STARS', 'albedo'),     # Surface albedo
-    'SAVI': ('L2T_STARS', 'SAVI'),         # Soil Adjusted Vegetation Index
-    'Ta_C': ('L3T_MET', 'Ta'),             # Air Temperature in Celsius (native units)
-    'Ta': ('L3T_MET', 'Ta'),               # Air Temperature in Celsius (alias for Ta_C)
-    'RH': ('L3T_MET', 'RH'),               # Relative humidity
-    'SM': ('L3T_SM', 'SM'),                # Soil moisture
+    'Ta_C': ('L3T_ETAUX', 'Ta'),            # Air temperature in Celsius
+    'Ta': ('L3T_ETAUX', 'Ta'),              # Alias for Ta_C
+    'RH': ('L3T_ETAUX', 'RH'),              # Relative humidity ratio (0-1)
+    'SM': ('L3T_ETAUX', 'SM'),              # Soil moisture ratio (0-1)
+    'Rg': ('L3T_ETAUX', 'Rg'),              # Global radiation (W/m2)
+    'Rn': ('L3T_ETAUX', 'Rn'),              # Net radiation (W/m2)
+    'cloud': ('L3T_ETAUX', 'cloud'),        # Cloud mask
+    'water': ('L3T_ETAUX', 'water'),        # Water mask
 }
 
 DEFAULT_LAYERS = ['ST_C', 'NDVI', 'albedo']
+
+
+def _validate_layers(layers: List[str]) -> None:
+    unknown_layers = [layer for layer in layers if layer not in LAYER_MAPPING]
+    if unknown_layers:
+        raise ValueError(
+            f"Unknown layer(s): {', '.join(unknown_layers)}. "
+            f"Available Collection 3 layers: {', '.join(LAYER_MAPPING)}"
+        )
+    if not layers:
+        raise ValueError("At least one sampling layer must be requested")
+
+
+def _apply_layer_names(results: pd.DataFrame, layers: List[str]) -> pd.DataFrame:
+    source_variables = set()
+    for layer in layers:
+        _, variable = LAYER_MAPPING[layer]
+        source_variables.add(variable)
+        if layer == 'ST_C':
+            if variable in results:
+                results[layer] = results[variable] - 273.15
+        elif layer != variable and variable in results:
+            results[layer] = results[variable]
+
+    unrequested_sources = [
+        variable for variable in source_variables
+        if variable not in layers and variable in results.columns
+    ]
+    return results.drop(columns=unrequested_sources)
 
 
 def _search_cmr_for_tile_product(
@@ -313,7 +345,25 @@ def _sample_single_point_granule(
                         if value is not None:
                             has_data = True
                             granule_data[variable] = value
-    
+
+    elif product and (product.startswith('L3T_') or product.startswith('L4T_')):
+        for variable in products.get(product, []):
+            key = (granule, variable)
+            if key not in tile_files:
+                continue
+
+            file_info = tile_files[key]
+            value, meta = sample_point_from_url(
+                session,
+                file_info['url'],
+                lon,
+                lat
+            )
+
+            if value is not None:
+                has_data = True
+                granule_data[variable] = value
+
     return granule_data if has_data else None
 
 
@@ -358,7 +408,7 @@ def sample_point_from_url(
     
     Examples
     --------
-    >>> from ECOv002_CMR import setup_earthdata_session, sample_point_from_url
+    >>> from ECOv003_CMR import setup_earthdata_session, sample_point_from_url
     >>> session = setup_earthdata_session()
     >>> url = "https://data.lpdaac.earthdatacloud.nasa.gov/..."
     >>> value, meta = sample_point_from_url(session, url, -118.24, 34.05)
@@ -413,14 +463,14 @@ def sample_point_from_url(
                     
                     # Read pixel value
                     window = Window(px, py, 1, 1)
-                    value = src.read(1, window=window)[0, 0]
+                    value = src.read(1, window=window, masked=True)[0, 0]
                     
-                    # Check for nodata
+                    # Respect nodata values and internal raster masks, including NaN fill.
                     nodata = src.nodata
-                    if nodata is not None and value == nodata:
+                    if np.ma.is_masked(value):
                         return None, "nodata"
                     
-                    return value, {
+                    return float(value), {
                         'bounds': bounds_wgs84,
                         'crs': str(src.crs),
                         'nodata': nodata
@@ -455,7 +505,7 @@ def find_sentinel2_tile(lon: float, lat: float) -> Optional[str]:
     
     Examples
     --------
-    >>> from ECOv002_CMR import find_sentinel2_tile
+    >>> from ECOv003_CMR import find_sentinel2_tile
     >>> tile = find_sentinel2_tile(-118.24, 34.05)
     >>> print(f"Tile: {tile}")
     Tile: 11SLT
@@ -505,7 +555,7 @@ def sample_points_over_date_range(
         End date for searching granules.
     layers : list of str, optional
         Layer names to sample. Defaults to ['ST_C', 'NDVI', 'albedo'].
-        Available layers:
+        Available Collection 3 layers:
         - 'ST_C': Surface Temperature in Celsius (L2T_LSTE)
         - 'LST': Land Surface Temperature in Kelvin (L2T_LSTE)
         - 'LST_err': LST uncertainty (L2T_LSTE)
@@ -513,13 +563,12 @@ def sample_points_over_date_range(
         - 'emissivity': Wideband emissivity (L2T_LSTE) - recommended
         - 'EmisWB': Wideband emissivity (L2T_LSTE) - alias for emissivity
         - 'NDVI': Normalized Difference Vegetation Index (L2T_STARS)
-        - 'EVI': Enhanced Vegetation Index (L2T_STARS)
         - 'albedo': Surface albedo (L2T_STARS)
-        - 'SAVI': Soil Adjusted Vegetation Index (L2T_STARS)
-        - 'Ta_C': Air Temperature in Celsius (L3T_MET) - recommended
-        - 'Ta': Air Temperature in Celsius (L3T_MET) - alias for Ta_C
-        - 'RH': Relative humidity (L3T_MET)
-        - 'SM': Soil moisture (L3T_SM)
+        - 'Ta_C' / 'Ta': Near-surface air temperature in Celsius (L3T_ETAUX)
+        - 'RH': Relative humidity ratio (L3T_ETAUX)
+        - 'SM': Soil moisture ratio (L3T_ETAUX)
+        - 'Rg' / 'Rn': Global / net radiation in W/m2 (L3T_ETAUX)
+        - 'cloud' / 'water': Cloud and water masks (L3T_ETAUX)
     tile : str or list of str, optional
         Sentinel-2 tile name(s). If None, automatically determined from coordinates.
         Can be a single tile ('11SLT') or list of tiles for multiple points.
@@ -572,7 +621,7 @@ def sample_points_over_date_range(
     
     Sample all ECOSTRESS data in June 2025 (using defaults):
     
-    >>> from ECOv002_CMR import sample_points_over_date_range
+    >>> from ECOv003_CMR import sample_points_over_date_range
     >>> results = sample_points_over_date_range(
     ...     geometry=gdf,
     ...     start_date=date(2025, 6, 1),
@@ -598,7 +647,7 @@ def sample_points_over_date_range(
     ...     geometry=single_point,
     ...     start_date=date(2025, 6, 1),
     ...     end_date=date(2025, 6, 30),
-    ...     layers=['ST_C', 'NDVI', 'EVI']  # Custom layers
+    ...     layers=['ST_C', 'NDVI', 'albedo']  # Custom layers
     ... )
     
     Or use a single row from a GeoDataFrame (metadata will be propagated):
@@ -693,31 +742,17 @@ def sample_points_over_date_range(
     if not points_data:
         raise ValueError("No valid point geometries found in input")
     
+    _validate_layers(layers)
+
     # Map layer names to products/variables
     products = {}  # {product: [variable1, variable2, ...]}
-    layer_to_output_name = {}  # Map layer name to output column name
     
     for layer in layers:
-        if layer not in LAYER_MAPPING:
-            logger.warning(f"Unknown layer '{layer}', skipping")
-            continue
-        
         product, variable = LAYER_MAPPING[layer]
         if product not in products:
             products[product] = []
         if variable not in products[product]:
             products[product].append(variable)
-        
-        # For ST_C, we'll convert from LST (Kelvin) after sampling
-        # For Ta_C/Ta and emissivity/EmisWB, the source is already correct, just rename
-        if layer == 'ST_C':
-            layer_to_output_name['LST'] = 'ST_C'
-        elif layer in ['Ta_C', 'Ta']:
-            layer_to_output_name['Ta'] = layer  # Rename Ta variable to match requested layer name
-        elif layer in ['emissivity', 'EmisWB']:
-            layer_to_output_name['EmisWB'] = layer  # Rename EmisWB variable to match requested layer name
-        else:
-            layer_to_output_name[variable] = layer
     
     # Parse dates
     if isinstance(start_date, str):
@@ -870,15 +905,20 @@ def sample_points_over_date_range(
             
             # Build daily_granules lookup for L3T/L4T products
             daily_granules = {}  # {product: {date: granule}} for L3T/L4T products
+            primary_dates = set()
             for granule in granules:
                 parts = granule.split('_')
                 product = "_".join(parts[1:3]) if len(parts) > 2 else None
                 
-                if product and (product.startswith('L3T_') or product.startswith('L4T_')):
+                if product == 'L2T_LSTE' and len(parts) > 6:
+                    primary_dates.add(parts[6][:8])
+                elif product == 'L2T_STARS' and len(parts) > 4:
+                    primary_dates.add(parts[4])
+                elif product and (product.startswith('L3T_') or product.startswith('L4T_')):
                     if len(parts) > 6:
                         timestamp = parts[6]
                         date_str = timestamp[:8]
-                        
+
                         if product not in daily_granules:
                             daily_granules[product] = {}
                         daily_granules[product][date_str] = granule
@@ -911,6 +951,21 @@ def sample_points_over_date_range(
                             granule, date_str, None, None,
                             tile_files, products, daily_granules
                         ))
+
+            for date_granules in daily_granules.values():
+                for date_str, granule in date_granules.items():
+                    if date_str in primary_dates:
+                        continue
+
+                    parts = granule.split('_')
+                    timestamp = parts[6] if len(parts) > 6 else date_str
+                    orbit = parts[3] if len(parts) > 3 else None
+                    scene = parts[4] if len(parts) > 4 else None
+                    sampling_tasks.append((
+                        idx, point, metadata, lon, lat, point_tile,
+                        granule, timestamp, orbit, scene,
+                        tile_files, products, daily_granules
+                    ))
         
         # Execute tasks in parallel
         all_results = []
@@ -1154,6 +1209,47 @@ def sample_points_over_date_range(
             
             if has_data:
                 all_results.append(granule_data)
+
+        primary_dates = set(lst_granules) | set(stars_granules)
+        for product, date_granules in daily_granules.items():
+            for date_str, granule in date_granules.items():
+                if date_str in primary_dates:
+                    continue
+
+                parts = granule.split('_')
+                timestamp = parts[6] if len(parts) > 6 else date_str
+                granule_data = {
+                    'point_index': idx,
+                    'granule': granule,
+                    'lon': lon,
+                    'lat': lat,
+                    'tile': point_tile,
+                    'timestamp': timestamp,
+                    'orbit': parts[3] if len(parts) > 3 else None,
+                    'scene': parts[4] if len(parts) > 4 else None
+                }
+                granule_data.update(metadata)
+
+                has_data = False
+                for variable in products.get(product, []):
+                    key = (granule, variable)
+                    if key not in tile_files:
+                        continue
+
+                    file_info = tile_files[key]
+                    value, meta = sample_point_from_url(
+                        session,
+                        file_info['url'],
+                        lon,
+                        lat
+                    )
+
+                    if value is not None:
+                        has_data = True
+                        granule_data[variable] = value
+
+                if has_data:
+                    all_results.append(granule_data)
     
     if not all_results:
         logger.warning("No data sampled from any point-granule combinations")
@@ -1162,18 +1258,7 @@ def sample_points_over_date_range(
     # Create results DataFrame
     results_df = pd.DataFrame(all_results)
     
-    # Apply layer name mappings and conversions
-    for var_name, layer_name in layer_to_output_name.items():
-        if var_name in results_df.columns:
-            if layer_name == 'ST_C' and var_name == 'LST':
-                # Convert Kelvin to Celsius
-                results_df[layer_name] = results_df[var_name] - 273.15
-                # Keep LST in Kelvin only if explicitly requested
-                if 'LST' not in layers:
-                    results_df = results_df.drop(columns=[var_name])
-            elif layer_name != var_name:
-                # Rename column (no conversion needed for Ta - already Celsius)
-                results_df = results_df.rename(columns={var_name: layer_name})
+    results_df = _apply_layer_names(results_df, layers)
     
     # Filter out rows where any sampled variables are NaN
     if drop_na and len(results_df) > 0:
@@ -1218,7 +1303,9 @@ def sample_points_from_geodataframe(
         - List of shapely Point objects (requires datetime specification)
     layers : list of str, optional
         Layer names to sample. Defaults to ['ST_C', 'NDVI', 'albedo'].
-        Available: ST_C, LST, NDVI, EVI, albedo, SAVI, QC, LST_err, EmisWB
+        Available Collection 3 layers: ST_C, LST, LST_err, QC, emissivity,
+        EmisWB, NDVI, albedo, Ta_C, Ta, RH, SM, Rg, Rn, cloud, water.
+        L3T_ETAUX Ta is already in Celsius; RH and SM are ratios from 0 to 1.
     datetime_col : str, default 'datetime'
         Name of the datetime column (only used if geometry is a GeoDataFrame).
     tile_col : str, optional
@@ -1261,7 +1348,7 @@ def sample_points_from_geodataframe(
     ... }
     >>> gdf = gpd.GeoDataFrame(data, crs='EPSG:4326')
     >>> 
-    >>> from ECOv002_CMR import sample_points_from_geodataframe
+    >>> from ECOv003_CMR import sample_points_from_geodataframe
     >>> results = sample_points_from_geodataframe(geometry=gdf)
     >>> print(results[['site_id', 'datetime', 'ST_C', 'NDVI', 'albedo']])
     
@@ -1269,7 +1356,7 @@ def sample_points_from_geodataframe(
     
     >>> results = sample_points_from_geodataframe(
     ...     geometry=gdf,
-    ...     layers=['ST_C', 'EVI', 'QC']
+    ...     layers=['ST_C', 'albedo', 'QC']
     ... )
     """
     # Default layers
@@ -1297,17 +1384,16 @@ def sample_points_from_geodataframe(
     if not gdf.crs.equals(CRS.from_epsg(4326)):
         logger.info(f"Reprojecting GeoDataFrame from {gdf.crs} to EPSG:4326")
         gdf = gdf.to_crs('EPSG:4326')
-    
+
+    geometry_col = gdf.geometry.name
     if datetime_col not in gdf.columns:
         raise ValueError(f"Datetime column '{datetime_col}' not found in GeoDataFrame")
     
+    _validate_layers(layers)
+
     # Build products dictionary from layer names
     products = {}
     for layer in layers:
-        if layer not in LAYER_MAPPING:
-            raise ValueError(
-                f"Unknown layer '{layer}'. Available: {', '.join(LAYER_MAPPING.keys())}"
-            )
         product, variable = LAYER_MAPPING[layer]
         if product not in products:
             products[product] = []
@@ -1473,25 +1559,7 @@ def sample_points_from_geodataframe(
     # Create results DataFrame
     results_df = pd.DataFrame(all_results)
     
-    # Apply layer renaming and conversions
-    # Map product variables back to layer names
-    variable_to_layer = {}
-    for layer in layers:
-        product, variable = LAYER_MAPPING[layer]
-        variable_to_layer[variable] = layer
-    
-    # Rename columns and apply conversions
-    rename_map = {}
-    for variable, layer in variable_to_layer.items():
-        if variable in results_df.columns and variable != layer:
-            rename_map[variable] = layer
-    
-    if rename_map:
-        results_df = results_df.rename(columns=rename_map)
-    
-    # Convert LST to Celsius for ST_C layer
-    if 'ST_C' in results_df.columns:
-        results_df['ST_C'] = results_df['ST_C'] - 273.15
+    results_df = _apply_layer_names(results_df, layers)
     
     if verbose:
         logger.info(f"\nSampled {len(results_df)} observations from {len(gdf)} input points")

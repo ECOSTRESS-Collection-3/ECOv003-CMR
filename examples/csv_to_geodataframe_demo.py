@@ -55,8 +55,8 @@ print("\nConverted to GeoDataFrame:")
 print(gdf.head())
 
 # Define date range to search
-start_date = date(2025, 6, 1)
-end_date = date(2025, 6, 30)
+start_date = date(2026, 6, 1)
+end_date = date(2026, 6, 30)
 
 print("\n" + "=" * 80)
 print("SAMPLING ALL ECOSTRESS ACQUISITIONS")
@@ -118,4 +118,3 @@ else:
 # Cleanup sample file
 import os
 os.remove('sample_points.csv')
-

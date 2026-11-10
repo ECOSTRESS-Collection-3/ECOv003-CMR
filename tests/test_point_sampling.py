@@ -8,9 +8,12 @@ network requests or authentication.
 import pytest
 import pandas as pd
 import geopandas as gpd
+import numpy as np
 from datetime import datetime, date
 from shapely.geometry import Point
 from unittest.mock import Mock, patch, MagicMock
+from rasterio.io import MemoryFile
+from rasterio.transform import from_origin
 
 
 def test_import_point_sampling():
@@ -121,14 +124,164 @@ def test_sample_points_from_geodataframe_crs_reprojection():
     gdf = gpd.GeoDataFrame(data, crs='EPSG:3857')
     
     # Mock the search and session to avoid actual network calls
-    with patch('ECOv002_CMR.point_sampling.setup_earthdata_session'):
-        with patch('ECOv002_CMR.point_sampling.ECOSTRESS_CMR_search') as mock_search:
+    with patch('ECOv003_CMR.point_sampling.setup_earthdata_session'):
+        with patch('ECOv003_CMR.point_sampling.ECOSTRESS_CMR_search') as mock_search:
             mock_search.return_value = pd.DataFrame()  # Empty results
             
             result = sample_points_from_geodataframe(geometry=gdf, verbose=False)
             
             # Should return empty DataFrame (no data found), but no errors
             assert isinstance(result, pd.DataFrame)
+
+
+def test_collection3_layer_mapping_uses_supported_products_and_variables():
+    from ECOv003_CMR.constants import CONCEPT_IDS
+    from ECOv003_CMR.point_sampling import LAYER_MAPPING
+
+    assert {product for product, _ in LAYER_MAPPING.values()} <= set(CONCEPT_IDS)
+    assert LAYER_MAPPING["Ta_C"] == ("L3T_ETAUX", "Ta")
+    assert LAYER_MAPPING["RH"] == ("L3T_ETAUX", "RH")
+    assert LAYER_MAPPING["SM"] == ("L3T_ETAUX", "SM")
+    assert LAYER_MAPPING["Rg"] == ("L3T_ETAUX", "Rg")
+    assert LAYER_MAPPING["Rn"] == ("L3T_ETAUX", "Rn")
+    assert "EVI" not in LAYER_MAPPING
+    assert "SAVI" not in LAYER_MAPPING
+    assert not {"L3T_MET", "L3T_SM", "L3T_SEB"} & {
+        product for product, _ in LAYER_MAPPING.values()
+    }
+
+
+@pytest.mark.parametrize("sampling_function", ["date_range", "geodataframe"])
+def test_removed_collection2_layers_are_rejected(sampling_function):
+    from ECOv003_CMR import sample_points_from_geodataframe, sample_points_over_date_range
+
+    if sampling_function == "date_range":
+        with pytest.raises(ValueError, match="EVI"):
+            sample_points_over_date_range(
+                geometry=Point(-118.24, 34.05),
+                start_date="2026-06-01",
+                end_date="2026-06-01",
+                layers=["EVI"],
+                session=Mock(),
+                verbose=False,
+            )
+    else:
+        gdf = gpd.GeoDataFrame(
+            {"datetime": [datetime(2026, 6, 1)], "geometry": [Point(-118.24, 34.05)]},
+            crs="EPSG:4326",
+        )
+        with pytest.raises(ValueError, match="EVI"):
+            sample_points_from_geodataframe(
+                geometry=gdf,
+                layers=["EVI"],
+                session=Mock(),
+                verbose=False,
+            )
+
+
+def test_sample_point_from_url_reads_values_and_nan_nodata():
+    from ECOv003_CMR import sample_point_from_url
+
+    def geotiff_bytes(value, nodata):
+        with MemoryFile() as memfile:
+            with memfile.open(
+                driver="GTiff",
+                height=1,
+                width=1,
+                count=1,
+                dtype="float32",
+                crs="EPSG:4326",
+                transform=from_origin(-120, 40, 1, 1),
+                nodata=nodata,
+            ) as dataset:
+                dataset.write(np.array([[value]], dtype="float32"), 1)
+            return memfile.read()
+
+    session = Mock()
+    session.get.return_value.content = geotiff_bytes(298.15, np.nan)
+    value, _ = sample_point_from_url(session, "https://example.test/lst.tif", -119.5, 39.5)
+    assert value == pytest.approx(298.15)
+
+    session.get.return_value.content = geotiff_bytes(np.nan, np.nan)
+    value, reason = sample_point_from_url(session, "https://example.test/lst.tif", -119.5, 39.5)
+    assert value is None
+    assert reason == "nodata"
+
+
+def test_sample_points_from_geodataframe_converts_collection3_lst_to_celsius(monkeypatch):
+    import importlib
+
+    point_sampling = importlib.import_module("ECOv003_CMR.point_sampling")
+    granule = "ECOv003_L2T_LSTE_44814_001_52NHN_20260601T000306_02"
+    search_results = pd.DataFrame(
+        [{
+            "type": "GeoTIFF Data",
+            "variable": "LST",
+            "granule": granule,
+            "URL": "https://example.test/lst.tif",
+            "orbit": 44814,
+            "scene": 1,
+        }]
+    )
+    monkeypatch.setattr(point_sampling, "find_sentinel2_tile", lambda lon, lat: "52NHN")
+    monkeypatch.setattr(point_sampling, "ECOSTRESS_CMR_search", lambda **kwargs: search_results)
+    monkeypatch.setattr(
+        point_sampling,
+        "sample_point_from_url",
+        lambda *args, **kwargs: (300.0, {"nodata": None}),
+    )
+
+    gdf = gpd.GeoDataFrame(
+        {"datetime": [datetime(2026, 6, 1)], "geometry": [Point(-118.24, 34.05)]},
+        crs="EPSG:4326",
+    )
+    results = point_sampling.sample_points_from_geodataframe(
+        geometry=gdf,
+        layers=["ST_C", "LST"],
+        session=Mock(),
+        verbose=False,
+    )
+
+    assert results.loc[0, "LST"] == pytest.approx(300.0)
+    assert results.loc[0, "ST_C"] == pytest.approx(26.85)
+
+
+@pytest.mark.parametrize("max_workers", [1, 2])
+def test_sample_points_over_date_range_supports_etaux_only(monkeypatch, max_workers):
+    import importlib
+
+    point_sampling = importlib.import_module("ECOv003_CMR.point_sampling")
+    granule = "ECOv003_L3T_ETAUX_44814_001_53NMH_20260601T000306_01"
+    search_results = pd.DataFrame(
+        [{
+            "type": "GeoTIFF Data",
+            "variable": "Ta",
+            "granule": granule,
+            "URL": "https://example.test/ta.tif",
+            "orbit": 44814,
+            "scene": 1,
+        }]
+    )
+    monkeypatch.setattr(point_sampling, "find_sentinel2_tile", lambda lon, lat: "53NMH")
+    monkeypatch.setattr(point_sampling, "ECOSTRESS_CMR_search", lambda **kwargs: search_results)
+    monkeypatch.setattr(
+        point_sampling,
+        "sample_point_from_url",
+        lambda *args, **kwargs: (21.5, {"nodata": None}),
+    )
+
+    results = point_sampling.sample_points_over_date_range(
+        geometry=Point(-118.24, 34.05),
+        start_date="2026-06-01",
+        end_date="2026-06-01",
+        layers=["Ta_C"],
+        session=Mock(),
+        max_workers=max_workers,
+        verbose=False,
+    )
+
+    assert len(results) == 1
+    assert results.loc[0, "Ta_C"] == pytest.approx(21.5)
 
 
 def test_sample_point_from_url_success():
