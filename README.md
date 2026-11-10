@@ -1,467 +1,214 @@
-# Common Metadata Repository (CMR) Search for ECOSTRESS Collection 2
+# ECOSTRESS Collection 3 CMR Tools
 
-![CI](https://github.com/ECOSTRESS-Collection-2/ECOv002-CMR/actions/workflows/ci.yml/badge.svg)
+`ECOv003-CMR` searches NASA's [Common Metadata Repository (CMR)](https://cmr.earthdata.nasa.gov/) for ECOSTRESS Collection 3 granules, downloads granules, and samples raster values at geographic points.
 
-The `ECOv002-CMR` Python package is a utility for searching and downloading ECOSTRESS Collection 2 tiled data product granules using the [Common Metadata Repository (CMR) API](https://cmr.earthdata.nasa.gov/).
+[![CI](https://github.com/ECOSTRESS-Collection-3/ECOv003-CMR/actions/workflows/ci.yml/badge.svg)](https://github.com/ECOSTRESS-Collection-3/ECOv003-CMR/actions/workflows/ci.yml)
 
-[Gregory H. Halverson](https://github.com/gregory-halverson-jpl) (they/them)<br>
-[gregory.h.halverson@jpl.nasa.gov](mailto:gregory.h.halverson@jpl.nasa.gov)<br>
-NASA Jet Propulsion Laboratory 329G
+## Requirements and installation
 
-## Pre-Requisites
-
-This package uses [wget](https://www.gnu.org/software/wget/) for file transfers.
-
-On macOS, install [wget](https://formulae.brew.sh/formula/wget) with [Homebrew](https://brew.sh/):
-
-```
-brew install wget
-```
-
-## Installation
-
-Install the [ECOv002-CMR](https://pypi.org/project/ECOv002-CMR/) package, with a dash in the name, from PyPi using pip:
-
-```
-pip install ECOv002-CMR
-```
-
-## Authentication
-
-ECOSTRESS data requires NASA Earthdata authentication. Set up your credentials using one of these methods:
-
-**Option 1: Create a `.netrc` file** (recommended)
+Python 3.10 or later is required. Install the package from PyPI:
 
 ```bash
-cat > ~/.netrc << EOF
+python -m pip install ECOv003-CMR
+```
+
+## NASA Earthdata authentication
+
+CMR search is public. Downloading and reading ECOSTRESS data requires a NASA Earthdata account and credentials. Configure either `~/.netrc`:
+
+```text
 machine urs.earthdata.nasa.gov
     login YOUR_USERNAME
     password YOUR_PASSWORD
-EOF
+```
+
+or the `EARTHDATA_USERNAME` and `EARTHDATA_PASSWORD` environment variables. Protect the `.netrc` file so that only your account can read it:
+
+```bash
 chmod 600 ~/.netrc
 ```
 
-**Option 2: Environment variables**
+Create an account at [urs.earthdata.nasa.gov](https://urs.earthdata.nasa.gov/) and authorize the relevant LP DAAC applications if prompted.
+
+## Supported products
+
+The package supports these Collection 3 CMR product codes:
+
+| Product | Description | Example variables |
+|---|---|---|
+| `L1CT_RAD` | Calibrated at-sensor radiance | `radiance_1` |
+| `L2T_LSTE` | Land surface temperature and emissivity | `LST`, `LST_err`, `QC`, `EmisWB` |
+| `L2T_STARS` | Surface reflectance and vegetation/albedo layers | `NDVI`, `albedo` |
+| `L3T_ETAUX` | Tiled evapotranspiration auxiliary data | `Ta`, `RH`, `SM`, `Rg`, `Rn`, `cloud`, `water` |
+| `L3T_JET` | Jet Propulsion Laboratory evapotranspiration product | `PTJPLSMinst` |
+| `L4T_ESI` | Evaporative Stress Index | `ESI` |
+| `L4T_WUE` | Water Use Efficiency | `WUE` |
+
+Collection 3 replaces the separate Collection 2 `L3T_MET`, `L3T_SM`, and `L3T_SEB` products with `L3T_ETAUX`. Do not use the discontinued product names for Collection 3 searches.
+
+## Search CMR
+
+Use `ECOSTRESS_CMR_search()` to find files for a product, Sentinel-2 tile, and date range:
+
+```python
+from datetime import date
+from ECOv003_CMR import ECOSTRESS_CMR_search
+
+results = ECOSTRESS_CMR_search(
+    product="L2T_LSTE",
+    tile="52NHN",
+    start_date=date(2026, 6, 1),
+    end_date=date(2026, 6, 7),
+)
+
+geotiffs = results[results["type"] == "GeoTIFF Data"]
+print(geotiffs[["product", "variable", "granule", "URL"]].head())
+```
+
+The result is a pandas DataFrame with parsed granule and file metadata. Search accepts a product or list of products and a tile or list of tiles. Use `CONCEPT_IDS` for the supported product-to-CMR collection map.
+
+The command-line search accepts the same products:
 
 ```bash
-export EARTHDATA_USERNAME=YOUR_USERNAME
-export EARTHDATA_PASSWORD=YOUR_PASSWORD
+ECOv003-search \
+  --product L2T_LSTE L2T_STARS \
+  --tile 52NHN \
+  --start-date 2026-06-01 \
+  --end-date 2026-06-07 \
+  --output ecostress-files.csv
 ```
 
-Register for a free account at [urs.earthdata.nasa.gov](https://urs.earthdata.nasa.gov/) if you don't have one.
+Run `ECOv003-search --help` for all options.
 
-## Usage
+## Download granules
 
-Import the `ECOv002_CMR` package, with an underscore in the name:
+Download and open granules from Python with `download_ECOSTRESS_granule()`:
 
 ```python
-import ECOv002_CMR
 from datetime import date
-```
+from ECOv003_CMR import download_ECOSTRESS_granule
 
-### Search for ECOSTRESS Granules
-
-Use `ECOSTRESS_CMR_search()` to query the CMR API and get available granules without downloading:
-
-Valid product codes are: `L2T_LSTE`, `L2T_STARS`, `L3T_MET`, `L3T_SM`, `L3T_SEB`, `L3T_JET`, `L4T_ESI`, and `L4T_WUE`.
-
-```python
-from ECOv002_CMR import ECOSTRESS_CMR_search
-
-# Search for Land Surface Temperature data
-results = ECOSTRESS_CMR_search(
-    product="L2T_LSTE",              # Product name
-    tile="11SLT",                    # Sentinel-2 tile ID
-    start_date=date(2025, 6, 1),     # Start date
-    end_date=date(2025, 6, 30)       # End date (optional, defaults to start_date)
-)
-
-# Results is a pandas DataFrame with columns:
-# - product, variable, orbit, scene, tile
-# - type (e.g., 'GeoTIFF Data', 'JSON Metadata')
-# - granule, filename, URL
-
-print(f"Found {len(results)} files")
-print(results[['variable', 'orbit', 'scene', 'URL']].head())
-
-# Filter for specific variables
-lst_files = results[
-    (results['type'] == 'GeoTIFF Data') & 
-    (results['variable'] == 'LST')
-]
-
-# Filter for specific orbit/scene (optional)
-specific_granule = ECOSTRESS_CMR_search(
-    product="L2T_LSTE",
-    tile="11SLT",
-    start_date=date(2025, 6, 1),
-    orbit=52314,                     # Filter by orbit number
-    scene=3                          # Filter by scene number
-)
-```
-
-### Download an ECOSTRESS Granule
-
-Use `download_ECOSTRESS_granule()` to download all files for a specific granule:
-
-```python
-from ECOv002_CMR import download_ECOSTRESS_granule
-
-# Download a granule by date
 granule = download_ECOSTRESS_granule(
     product="L2T_LSTE",
-    tile="10UEV",
-    aquisition_date=date(2023, 8, 1),
-    parent_directory="./data"        # Where to save (default: ~/data/ECOSTRESS)
+    tile="52NHN",
+    aquisition_date=date(2026, 6, 1),
+    parent_directory="./data",
 )
-
-# Download specific orbit/scene
-granule = download_ECOSTRESS_granule(
-    product="L2T_LSTE",
-    tile="10UEV",
-    aquisition_date=date(2023, 8, 1),
-    orbit=52314,
-    scene=3
-)
-
-# The returned object is an ECOSTRESSGranule instance
 print(granule)
 ```
 
-### Available Products
+The default parent directory is `~/data/ECOSTRESS_v003`. The equivalent CLI command is:
 
-The package supports these ECOSTRESS Collection 2 products:
-
-| Product Code | Description | Key Variables |
-|-------------|-------------|---------------|
-| `L2T_LSTE` | Land Surface Temperature & Emissivity | LST, LST_err, QC, EmisWB |
-| `L2T_STARS` | Surface Reflectance & Albedo | NDVI, albedo, reflectance bands |
-| `L3T_MET` | Meteorological Data | temperature, pressure, humidity |
-| `L3T_SM` | Soil Moisture | soil moisture estimates |
-| `L3T_SEB` | Surface Energy Balance | latent heat, sensible heat, net radiation |
-| `L3T_JET` | Evapotranspiration Ensemble | ensemble ET products |
-| `L4T_ESI` | Evaporative Stress Index | ESI, anomaly |
-| `L4T_WUE` | Water Use Efficiency | WUE metrics |
-
-### Finding Your Tile
-
-ECOSTRESS uses the Sentinel-2 MGRS tiling system. Find your tile using coordinates:
-
-```python
-from sentinel_tiles import sentinel_tiles
-from shapely.geometry import Point
-
-# Find tile for a coordinate (lon, lat)
-point = Point(-118.2437, 34.0522)  # Los Angeles
-tile = sentinel_tiles.nearest(point)
-print(f"Tile: {tile}")  # Output: 11SLT
+```bash
+ECOv003-download \
+  --product L2T_LSTE \
+  --tile 52NHN \
+  --start-date 2026-06-01 \
+  --parent-directory ./data
 ```
 
-Or browse the [Sentinel-2 tiling grid](https://sentinels.copernicus.eu/web/sentinel/missions/sentinel-2/data-products).
+Downloading requires Earthdata authentication. The CLI accepts multiple products and tiles, date ranges, and optional orbit/scene filters; see `ECOv003-download --help`.
 
-## Point Sampling
+## Point sampling
 
-Sample ECOSTRESS data at specific geographic points. Choose from two approaches:
+Point-sampling functions are exported by `ECOv003_CMR`. Coordinates are interpreted as EPSG:4326; GeoDataFrames must declare a CRS and are reprojected to WGS84 when needed. `ST_C` is returned in Celsius, while `LST` remains in Kelvin.
 
-1. **Date Range Sampling (Recommended)**: Automatically find and sample all available ECOSTRESS acquisitions in a date range
-2. **Datetime Sampling (Legacy)**: Sample at specific acquisition times if you already know them
+### Search a date range
 
-### Why Date Range Sampling?
-
-ECOSTRESS acquisition times are not known in advance - they depend on the International Space Station's orbit and imaging schedule. The date range approach searches for all available data and samples all found acquisitions.
-
-### Sample at Single Point
-
-Extract values at specific coordinates from ECOSTRESS rasters:
+Use `sample_points_over_date_range()` when you do not know the acquisition times. It searches CMR for acquisitions over the requested period:
 
 ```python
-from ECOv002_CMR import (
-    setup_earthdata_session,
-    sample_point_from_url,
-    ECOSTRESS_CMR_search
-)
 from datetime import date
+import geopandas as gpd
+from shapely.geometry import Point
+from ECOv003_CMR import sample_points_over_date_range
 
-# Set up authenticated session
-session = setup_earthdata_session()
-
-# Search for data
-results = ECOSTRESS_CMR_search(
-    product="L2T_LSTE",
-    tile="11SLT",
-    start_date=date(2025, 6, 15)
+sites = gpd.GeoDataFrame(
+    {
+        "site_id": ["downtown", "airport"],
+        "geometry": [Point(-118.2437, 34.0522), Point(-118.4085, 33.9416)],
+    },
+    crs="EPSG:4326",
 )
 
-# Get URL for LST variable
-lst_files = results[
-    (results['type'] == 'GeoTIFF Data') & 
-    (results['variable'] == 'LST')
-]
-url = lst_files.iloc[0]['URL']
+samples = sample_points_over_date_range(
+    geometry=sites,
+    start_date=date(2026, 6, 1),
+    end_date=date(2026, 6, 7),
+    layers=["ST_C", "NDVI", "albedo", "Ta_C"],
+)
+print(samples[["site_id", "timestamp", "ST_C", "NDVI", "albedo", "Ta_C"]])
+```
 
-# Sample at coordinate (lon, lat in WGS84)
+The default layers are `ST_C`, `NDVI`, and `albedo`. This function can also accept a single Shapely `Point`, a list of points, or a GeoSeries. It uses `max_workers` to control parallel sampling.
+
+### Sample near known datetimes
+
+Use `sample_points_from_geodataframe()` when your GeoDataFrame has a datetime column for each point. It searches within `date_buffer_days` of each datetime:
+
+```python
+from datetime import datetime
+import geopandas as gpd
+from shapely.geometry import Point
+from ECOv003_CMR import sample_points_from_geodataframe
+
+sites = gpd.GeoDataFrame(
+    {
+        "site_id": ["downtown"],
+        "datetime": [datetime(2026, 6, 1, 12)],
+        "geometry": [Point(-118.2437, 34.0522)],
+    },
+    crs="EPSG:4326",
+)
+
+samples = sample_points_from_geodataframe(
+    geometry=sites,
+    layers=["ST_C", "NDVI", "albedo"],
+    datetime_col="datetime",
+    date_buffer_days=1,
+)
+print(samples[["site_id", "timestamp", "ST_C", "NDVI", "albedo"]])
+```
+
+### Available sampling layers
+
+| Layer | Product variable | Units or meaning |
+|---|---|---|
+| `ST_C` | `L2T_LSTE` / `LST` | Land surface temperature, Celsius (converted from Kelvin) |
+| `LST` | `L2T_LSTE` / `LST` | Land surface temperature, Kelvin |
+| `LST_err`, `QC`, `EmisWB` / `emissivity` | `L2T_LSTE` | Uncertainty, quality, and wideband emissivity |
+| `NDVI`, `albedo` | `L2T_STARS` | Vegetation index and albedo |
+| `Ta_C` / `Ta` | `L3T_ETAUX` / `Ta` | Near-surface air temperature, Celsius |
+| `RH`, `SM` | `L3T_ETAUX` | Relative humidity and soil moisture ratios |
+| `Rg`, `Rn` | `L3T_ETAUX` | Global and net radiation, W/m² |
+| `cloud`, `water` | `L3T_ETAUX` | Cloud and water masks |
+
+The former `EVI` and `SAVI` layers are not included in the supported Collection 3 sampling mappings. Unsupported layers raise `ValueError`.
+
+### Sample one raster URL
+
+`sample_point_from_url()` samples one pixel from a raster URL and returns `(value, metadata)`. If the point is outside the raster or has nodata, the value is `None` and the second result describes the reason.
+
+```python
+from ECOv003_CMR import setup_earthdata_session, sample_point_from_url
+
+session = setup_earthdata_session()
 value, metadata = sample_point_from_url(
     session=session,
-    url=url,
-    lon=-118.2437,  # Downtown LA
-    lat=34.0522
-)
-
-if value is not None:
-    print(f"LST: {value:.2f} K ({value - 273.15:.2f}°C)")
-else:
-    print(f"Sampling failed: {metadata}")
-```
-
-### Batch Sampling for All Available Acquisitions (Recommended)
-
-Sample multiple points across all ECOSTRESS acquisitions in a date range with automatic temperature conversion:
-
-```python
-import geopandas as gpd
-from datetime import date
-from shapely.geometry import Point
-from ECOv002_CMR import sample_points_over_date_range
-
-# Create GeoDataFrame with points (no datetime needed!)
-data = {
-    'site_id': ['site_A', 'site_B', 'site_C'],
-    'geometry': [
-        Point(-118.24, 34.05),   # Downtown LA
-        Point(-118.41, 33.94),   # LAX Airport
-        Point(-118.14, 34.15)    # Pasadena
-    ]
-}
-gdf = gpd.GeoDataFrame(data, crs='EPSG:4326')
-
-# Sample all available acquisitions in June 2025
-# Uses default layers: ST_C (surface temp in Celsius), NDVI, albedo
-results = sample_points_over_date_range(
-    geometry=gdf,  # Can also be list of Point objects or GeoSeries
-    start_date=date(2025, 6, 1),
-    end_date=date(2025, 6, 30)
-)
-
-# Results DataFrame contains all point-acquisition combinations
-# ST_C is automatically converted from Kelvin to Celsius!
-print(results[['site_id', 'timestamp', 'ST_C', 'NDVI', 'albedo']])
-
-# See how many acquisitions covered each site
-print(results.groupby('site_id').size())
-
-# Save results
-results.to_csv('ecostress_samples.csv', index=False)
-```
-
-**Available layers** (defaults to `['ST_C', 'NDVI', 'albedo']`):
-- `ST_C` - Surface Temperature in Celsius (auto-converted from LST)
-- `LST` - Land Surface Temperature in Kelvin
-- `NDVI` - Normalized Difference Vegetation Index  
-- `albedo` - Surface albedo
-- `SAVI` - Soil Adjusted Vegetation Index
-- `QC` - Quality control flags
-- `LST_err` - LST uncertainty
-- `EmisWB` - Wideband emissivity
-
-**Custom layers example:**
-```python
-# Request specific layers
-results = sample_points_over_date_range(
-    geometry=gdf,
-    start_date=date(2025, 6, 1),
-    end_date=date(2025, 6, 30),
-    layers=['ST_C', 'NDVI', 'QC']  # Custom selection
+    url="URL_FROM_A_CMR_SEARCH_RESULT",
+    lon=-118.2437,
+    lat=34.0522,
 )
 ```
 
-**Using a list of points (no GeoDataFrame needed):**
-```python
-from shapely.geometry import Point
+See the scripts in [`examples/`](examples/) for runnable workflows, including CSV input and multi-site sampling.
 
-points = [
-    Point(-118.24, 34.05),
-    Point(-118.41, 33.94),
-    Point(-118.14, 34.15)
-]
+## Development and tests
 
-results = sample_points_over_date_range(
-    geometry=points,  # Just a list of Point objects!
-    start_date=date(2025, 6, 1),
-    end_date=date(2025, 6, 30)
-)
+The test suite uses mocked CMR responses and in-memory raster fixtures; it does not require authenticated downloads:
+
+```bash
+pytest -q
 ```
 
-### Batch Sampling with Specific Datetimes
-
-If you do know specific acquisition times you want to sample:
-
-```python
-import geopandas as gpd
-from datetime import datetime
-from shapely.geometry import Point
-from ECOv002_CMR import sample_points_from_geodataframe
-
-# Create GeoDataFrame with points and datetimes
-data = {
-    'site_id': ['site_A', 'site_B', 'site_C'],
-    'datetime': [
-        datetime(2025, 6, 15, 12, 0),
-        datetime(2025, 6, 20, 14, 0),
-        datetime(2025, 6, 25, 10, 0)
-    ],
-    'geometry': [
-        Point(-118.24, 34.05),   # Downtown LA
-        Point(-118.41, 33.94),   # LAX Airport
-        Point(-118.14, 34.15)    # Pasadena
-    ]
-}
-gdf = gpd.GeoDataFrame(data, crs='EPSG:4326')
-
-# Define products and variables to sample
-products = {
-    'L2T_LSTE': 'LST',                    # Land Surface Temperature
-    'L2T_STARS': ['NDVI', 'albedo']       # NDVI and Albedo
-}
-
-# Sample all points
-results = sample_points_from_geodataframe(
-    gdf=gdf,
-    products=products,
-    date_buffer_days=3,  # Search ±3 days around each datetime
-    verbose=True
-)
-
-# Results DataFrame contains sampled values
-print(results[['site_id', 'timestamp', 'LST', 'NDVI', 'albedo']])
-
-# Convert temperature to Celsius
-results['LST_celsius'] = results['LST'] - 273.15
-
-# Save results
-results.to_csv('ecostress_samples.csv', index=False)
-```
-
-This approach uses `date_buffer_days` to search for granules near each specified datetime. Useful when you have specific target times but want to allow some flexibility.
-
-See [examples/geodataframe_sampling_demo.py](examples/geodataframe_sampling_demo.py) for the recommended date-range approach.
-
-### Working with Multiple Variables
-
-Search across multiple products and combine results:
-
-```python
-from ECOv002_CMR import ECOSTRESS_CMR_search
-
-# Products and their variables
-products = {
-    "L2T_LSTE": ["LST", "QC"],
-    "L2T_STARS": ["NDVI", "albedo"]
-}
-
-tile = "11SLT"
-start = date(2025, 6, 1)
-end = date(2025, 6, 30)
-
-all_files = {}
-
-for product, variables in products.items():
-    results = ECOSTRESS_CMR_search(
-        product=product,
-        tile=tile,
-        start_date=start,
-        end_date=end
-    )
-    
-    for variable in variables:
-        var_files = results[
-            (results['type'] == 'GeoTIFF Data') & 
-            (results['variable'] == variable)
-        ]
-        all_files[variable] = var_files
-        print(f"{variable}: {len(var_files)} files")
-```
-
-### Advanced Point Sampling Options
-
-**Custom tile specification:**
-
-```python
-# Pre-specify tiles instead of auto-detecting
-gdf['tile'] = ['11SLT', '11SLT', '11SLT']
-
-results = sample_points_from_geodataframe(
-    gdf=gdf,
-    products=products,
-    tile_col='tile'  # Use pre-specified tiles
-)
-```
-
-**Find Sentinel-2 tile for a coordinate:**
-
-```python
-from ECOv002_CMR import find_sentinel2_tile
-
-tile = find_sentinel2_tile(lon=-118.24, lat=34.05)
-print(f"Tile: {tile}")  # Output: 11SLT
-```
-
-**Custom datetime column names:**
-
-```python
-results = sample_points_from_geodataframe(
-    gdf=gdf,
-    products=products,
-    geometry_col='location',  # Custom geometry column
-    datetime_col='timestamp'  # Custom datetime column
-)
-```
-
-See [examples/point_sampling_demo.py](examples/point_sampling_demo.py) for single-point sampling workflow.
-
-### Date Formats
-
-Dates can be specified as `date` objects or strings:
-
-```python
-from datetime import date
-from dateutil import parser
-
-# Using date objects (recommended)
-results = ECOSTRESS_CMR_search(
-    product="L2T_LSTE",
-    tile="11SLT",
-    start_date=date(2025, 6, 1),
-    end_date=date(2025, 6, 30)
-)
-
-# Using date strings
-results = ECOSTRESS_CMR_search(
-    product="L2T_LSTE",
-    tile="11SLT",
-    start_date="2025-06-01",
-    end_date="2025-06-30"
-)
-```
-
-### Error Handling
-
-```python
-from ECOv002_CMR import ECOSTRESS_CMR_search
-
-try:
-    results = ECOSTRESS_CMR_search(
-        product="L2T_LSTE",
-        tile="11SLT",
-        start_date=date(2025, 6, 1)
-    )
-    
-    if results.empty:
-        print("No granules found for specified criteria")
-    else:
-        print(f"Found {len(results)} files")
-        
-except ValueError as e:
-    print(f"Invalid parameter: {e}")
-except Exception as e:
-    print(f"Search failed: {e}")
-```
+Live authenticated download/open and point-sampling checks are recommended before a release.

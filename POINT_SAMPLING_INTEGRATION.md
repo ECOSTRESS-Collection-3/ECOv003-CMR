@@ -1,188 +1,96 @@
-# Point Sampling Integration Summary
+# Collection 3 Point Sampling
 
-## Overview
+`ECOv003_CMR.point_sampling` provides point sampling for ECOSTRESS Collection 3 CMR assets. Public functions are exported from `ECOv003_CMR`:
 
-The ECOv002_CMR package now supports point sampling from ECOSTRESS Collection 2 Cloud-Optimized GeoTIFFs. Users can sample raster data at specific geographic coordinates without downloading entire files, and can batch-process multiple points using GeoDataFrames.
+- `sample_point_from_url(session, url, lon, lat)` samples one pixel from one raster URL.
+- `sample_points_over_date_range(geometry, start_date, end_date, ...)` searches for available granules over a date range and samples them.
+- `sample_points_from_geodataframe(geometry, layers, datetime_col=..., ...)` samples around datetimes already provided in a GeoDataFrame.
+- `find_sentinel2_tile(lon, lat)` returns the Sentinel-2 tile for a coordinate when available.
 
-## New Modules
+## Collection 3 product and layer mappings
 
-### 1. `ECOv002_CMR/authentication.py`
+| Sampling layer | CMR product | CMR variable | Units or meaning |
+|---|---|---|---|
+| `ST_C` | `L2T_LSTE` | `LST` | Land surface temperature converted from Kelvin to Celsius |
+| `LST` | `L2T_LSTE` | `LST` | Land surface temperature in Kelvin |
+| `LST_err`, `QC` | `L2T_LSTE` | `LST_err`, `QC` | Uncertainty and quality flags |
+| `EmisWB`, `emissivity` | `L2T_LSTE` | `EmisWB` | Wideband emissivity |
+| `NDVI`, `albedo` | `L2T_STARS` | `NDVI`, `albedo` | Vegetation index and albedo |
+| `Ta_C`, `Ta` | `L3T_ETAUX` | `Ta` | Near-surface air temperature in Celsius |
+| `RH`, `SM` | `L3T_ETAUX` | `RH`, `SM` | Relative humidity and soil moisture ratios |
+| `Rg`, `Rn` | `L3T_ETAUX` | `Rg`, `Rn` | Global and net radiation in W/m² |
+| `cloud`, `water` | `L3T_ETAUX` | `cloud`, `water` | Cloud and water masks |
 
-Handles NASA Earthdata authentication with multiple credential sources:
-- Direct username/password parameters
-- Environment variables (`EARTHDATA_USERNAME`, `EARTHDATA_PASSWORD`)
-- `~/.netrc` file
+`L3T_ETAUX` replaces the separate Collection 2 `L3T_MET`, `L3T_SM`, and `L3T_SEB` products. Collection 3 STARS mappings do not include `EVI` or `SAVI`. Unknown layer names raise `ValueError` rather than being silently ignored.
 
-**Key Function:**
-```python
-setup_earthdata_session(username=None, password=None, require_auth=True) -> requests.Session
-```
+## Authentication
 
-### 2. `ECOv002_CMR/point_sampling.py`
+CMR metadata searches are public. Sampling data URLs and downloading granules require NASA Earthdata authentication. Configure `~/.netrc` with `machine urs.earthdata.nasa.gov`, or set `EARTHDATA_USERNAME` and `EARTHDATA_PASSWORD`. `setup_earthdata_session()` creates the authenticated `requests.Session`; the sampling functions create one automatically if none is passed.
 
-Core point sampling functionality with three main functions:
+## Sampling all available acquisitions
 
-**`sample_point_from_url(session, url, lon, lat, max_retries=2, timeout=90)`**
-- Samples a single point from a raster URL
-- Downloads to memory (doesn't save to disk)
-- Handles coordinate transformations automatically
-- Returns `(value, metadata)` or `(None, reason)`
-
-**`find_sentinel2_tile(lon, lat)`**
-- Determines which Sentinel-2 tile contains a coordinate
-- Returns tile name (e.g., "11SLT")
-
-**`sample_points_from_geodataframe(gdf, products, geometry_col='geometry', datetime_col='datetime', ...)`**
-- Main batch sampling API
-- Accepts GeoDataFrame with point geometries and datetimes
-- Automatically searches CMR for granules
-- Returns DataFrame with sampled values
-- Handles CRS transformations, tile detection, and date buffering
-
-## Updated Files
-
-### `pyproject.toml`
-Added new dependencies:
-- `rasterio` - For reading raster data from URLs into memory
-- `geopandas` - For working with geospatial DataFrames
-- `shapely` - For geometric operations
-
-### `ECOv002_CMR/__init__.py`
-Exports new functions:
-```python
-from .authentication import setup_earthdata_session
-from .point_sampling import (
-    sample_point_from_url,
-    sample_points_from_geodataframe,
-    find_sentinel2_tile
-)
-```
-
-### `README.md`
-Added comprehensive documentation:
-- Point sampling section with examples
-- Single-point sampling example
-- Batch GeoDataFrame sampling example
-- Advanced options (custom tiles, column names)
-
-### `examples/point_sampling_demo.py`
-Refactored to use new package functions instead of local implementations.
-
-## New Example Scripts
-
-### `examples/geodataframe_sampling_demo.py`
-Demonstrates batch point sampling:
-- Creates GeoDataFrame with multiple sites
-- Samples LST, NDVI, and albedo
-- Shows statistics and saves results
-
-### `examples/csv_to_geodataframe_demo.py`
-Shows complete workflow from CSV:
-- Loads points from CSV file
-- Converts to GeoDataFrame
-- Samples ECOSTRESS data
-- Exports enriched CSV
-
-### `examples/README.md`
-Updated with documentation for all three examples.
-
-## Tests
-
-### `tests/test_point_sampling.py`
-New test suite with 10 tests covering:
-- Import validation
-- Tile lookup functionality
-- Authentication setup (with/without credentials)
-- GeoDataFrame validation (CRS, required columns)
-- CRS reprojection
-- Function signatures
-
-**Test Results:** ✅ All 18 tests pass (8 existing + 10 new)
-
-## Key Features
-
-### 1. No Downloads Required
-Raster data is streamed to memory using rasterio's `MemoryFile`, avoiding disk I/O.
-
-### 2. Automatic Coordinate Handling
-- Input coordinates in WGS84 (EPSG:4326)
-- Automatic transformation to raster CRS
-- Bounds checking in consistent coordinate system
-
-### 3. Flexible Input
-- Single points via direct function calls
-- Batch processing via GeoDataFrame
-- CSV-based workflows
-- Custom date buffers for temporal matching
-
-### 4. Robust Error Handling
-Returns descriptive error messages:
-- `"outside_bounds"` - Point not in raster coverage
-- `"nodata"` - Point has no valid data
-- `"network_error: ..."` - Connection issues
-- `"coordinate_transform_error"` - Projection problems
-
-### 5. Multi-Variable Support
-Sample multiple products and variables simultaneously:
-```python
-products = {
-    'L2T_LSTE': 'LST',
-    'L2T_STARS': ['NDVI', 'albedo']
-}
-```
-
-## API Usage Example
+Provide point geometries and a date range when acquisition timestamps are not known:
 
 ```python
+from datetime import date
 import geopandas as gpd
-from datetime import datetime
 from shapely.geometry import Point
-from ECOv002_CMR import sample_points_from_geodataframe
+from ECOv003_CMR import sample_points_over_date_range
 
-# Create GeoDataFrame
-data = {
-    'site_id': ['A', 'B'],
-    'datetime': [datetime(2025, 6, 15), datetime(2025, 6, 20)],
-    'geometry': [Point(-118.24, 34.05), Point(-118.41, 33.94)]
-}
-gdf = gpd.GeoDataFrame(data, crs='EPSG:4326')
-
-# Define variables to sample
-products = {
-    'L2T_LSTE': 'LST',
-    'L2T_STARS': ['NDVI', 'albedo']
-}
-
-# Sample
-results = sample_points_from_geodataframe(
-    gdf=gdf,
-    products=products,
-    date_buffer_days=3,
-    verbose=True
+sites = gpd.GeoDataFrame(
+    {
+        "site_id": ["downtown", "airport"],
+        "geometry": [Point(-118.2437, 34.0522), Point(-118.4085, 33.9416)],
+    },
+    crs="EPSG:4326",
 )
 
-# results is a DataFrame with columns:
-# site_id, datetime, geometry, granule, timestamp, LST, NDVI, albedo, ...
+results = sample_points_over_date_range(
+    geometry=sites,
+    start_date=date(2026, 6, 1),
+    end_date=date(2026, 6, 7),
+    layers=["ST_C", "NDVI", "albedo", "Ta_C"],
+    max_workers=4,
+)
 ```
 
-## Migration Notes
+By default, this API samples `ST_C`, `NDVI`, and `albedo`. It accepts a GeoDataFrame, GeoSeries, list of Shapely points, or one point. `max_workers=1` runs sequentially.
 
-The original `point_sampling_demo.py` script has been updated to use the new package functions. The local implementations of `setup_earthdata_session()` and `check_point_in_raster()` have been removed in favor of:
-- `ECOv002_CMR.setup_earthdata_session()`
-- `ECOv002_CMR.sample_point_from_url()`
+## Sampling around known datetimes
 
-## Backward Compatibility
+When each input point has a datetime, use `sample_points_from_geodataframe()`:
 
-All existing package functionality remains unchanged. The new point sampling features are additive and don't affect existing APIs like:
-- `ECOSTRESS_CMR_search()`
-- `download_ECOSTRESS_granule()`
-- Other utility functions
+```python
+from datetime import datetime
+import geopandas as gpd
+from shapely.geometry import Point
+from ECOv003_CMR import sample_points_from_geodataframe
 
-## Next Steps
+sites = gpd.GeoDataFrame(
+    {
+        "site_id": ["downtown"],
+        "datetime": [datetime(2026, 6, 1, 12)],
+        "geometry": [Point(-118.2437, 34.0522)],
+    },
+    crs="EPSG:4326",
+)
 
-Consider these enhancements for future versions:
-1. **Parallelization** - Use ThreadPoolExecutor for concurrent sampling
-2. **Caching** - Cache CMR search results to avoid redundant queries
-3. **Buffered Sampling** - Sample neighborhoods (e.g., 3x3 pixel windows)
-4. **Time Series Analysis** - Built-in aggregation for temporal analysis
-5. **Integration Tests** - Add tests with actual ECOSTRESS data
+results = sample_points_from_geodataframe(
+    geometry=sites,
+    layers=["ST_C", "NDVI", "albedo"],
+    datetime_col="datetime",
+    date_buffer_days=1,
+)
+```
+
+Pass a GeoDataFrame with the configured datetime column. `tile_col` can name a column containing Sentinel-2 tile identifiers; otherwise tiles are determined from the coordinates.
+
+## Raster values, CRS, and nodata
+
+- Coordinates are interpreted in EPSG:4326; GeoDataFrames must declare a CRS and are reprojected to WGS84 when needed.
+- `ST_C` converts `LST` from Kelvin; `Ta_C` is an alias for the `L3T_ETAUX` `Ta` variable, already distributed in Celsius.
+- A point outside the raster bounds or on a masked/nodata pixel returns no value from `sample_point_from_url()`.
+- Point sampling reads the raster response into memory and extracts the requested pixel; no local raster file is created by this API.
+- Tests use in-memory GeoTIFFs and mocked CMR responses. They do not replace a real authenticated download/open check, which remains a pre-release integration test.
+
+Runnable workflows are in [`examples/`](examples/). See the [README](README.md) for installation, product support, and additional API examples.
