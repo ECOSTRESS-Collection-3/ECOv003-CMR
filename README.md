@@ -6,7 +6,7 @@
 
 ## Requirements and installation
 
-Python 3.10 or later is required. Install the package from PyPI:
+Python 3.11 or later is required. Install the package from PyPI:
 
 ```bash
 python -m pip install ECOv003-CMR
