@@ -1,11 +1,14 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 import logging
+import math
 import os
 from pathlib import Path
 from threading import Lock
+import time
 from typing import Any, Dict, List, Optional, Union
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -46,6 +49,18 @@ DEFAULT_STRATIFIED_LAYERS = [
     "Rn",
 ]
 
+UQ_LAYERS = DEFAULT_STRATIFIED_LAYERS.copy()
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.2f}m"
+    if seconds < 86400:
+        return f"{seconds / 3600:.2f}h"
+    return f"{seconds / 86400:.2f}d"
+
 
 def _load_completed_manifest(manifest_path: str) -> set:
     if not os.path.exists(manifest_path):
@@ -80,8 +95,11 @@ def build_stratified_dataset(
     """
     Build a spatially and seasonally stratified ECOSTRESS Collection 3 point-sample
     dataset with incremental Parquet checkpointing, manifest resuming, and
-    detailed pipeline logging.
+    stage-by-stage performance benchmarking.
     """
+    t_start = time.perf_counter()
+    timings: Dict[str, float] = {}
+
     def _log(msg: str) -> None:
         if verbose:
             logger.info(msg)
@@ -93,15 +111,23 @@ def build_stratified_dataset(
     if layers is None:
         layers = DEFAULT_STRATIFIED_LAYERS.copy()
 
+    t0 = time.perf_counter()
     _log(f"[1/6] Configuring NASA Earthdata session (output_dir={output_dir})")
     if session is None:
         session = setup_earthdata_session()
+    timings["auth_s"] = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     if tiles is None:
         _log("[2/6] Discovering global land-intersecting Sentinel-2 MGRS tiles...")
         tiles = list_ecostress_land_tiles()
-    _log(f"[2/6] Target tiles ({len(tiles)}): {', '.join(tiles[:10])}{'...' if len(tiles) > 10 else ''}")
+    timings["tile_discovery_s"] = time.perf_counter() - t0
+    _log(
+        f"[2/6] Target tiles ({len(tiles)}): {', '.join(tiles[:10])}"
+        f"{'...' if len(tiles) > 10 else ''} ({timings['tile_discovery_s']:.2f}s)"
+    )
 
+    t0 = time.perf_counter()
     _log(
         f"[3/6] Querying CMR for complete clear-sky ET overpasses "
         f"({start_date} to {end_date}, max_cloud_cover={max_cloud_cover})..."
@@ -113,13 +139,18 @@ def build_stratified_dataset(
         max_cloud_cover=max_cloud_cover,
         session=session,
     )
+    timings["cmr_search_s"] = time.perf_counter() - t0
     if candidate_granules.empty:
         _log("[3/6] No complete multi-product clear-sky ET granules found for the given window.")
-        return {"total_samples": 0, "selected_granules": 0, "n_cap": 0}
+        return {"total_samples": 0, "selected_granules": 0, "n_cap": 0, "timings": timings}
 
     tile_counts = candidate_granules.groupby("tile").size().to_dict()
-    _log(f"[3/6] Found {len(candidate_granules)} complete candidate overpasses across tiles: {tile_counts}")
+    _log(
+        f"[3/6] Found {len(candidate_granules)} complete candidate overpasses across tiles: "
+        f"{tile_counts} ({timings['cmr_search_s']:.2f}s)"
+    )
 
+    t0 = time.perf_counter()
     selected_granules, n_cap = select_stratified_granules(
         candidate_granules,
         min_granules_floor=min_granules_floor,
@@ -128,17 +159,18 @@ def build_stratified_dataset(
     )
     if selected_granules.empty:
         _log(f"[4/6] No tiles met min_granules_floor={min_granules_floor}.")
-        return {"total_samples": 0, "selected_granules": 0, "n_cap": 0}
+        return {"total_samples": 0, "selected_granules": 0, "n_cap": 0, "timings": timings}
 
     quota_k, candidate_n = compute_per_granule_quota(
         num_selected_granules=len(selected_granules),
         target_total_samples=target_total_samples,
         oversample_factor=oversample_factor,
     )
+    timings["selection_s"] = time.perf_counter() - t0
     _log(
         f"[4/6] Stratified selection: {len(selected_granules)} granules across "
         f"{selected_granules['tile'].nunique()} eligible tile(s) (N_cap={n_cap}, "
-        f"quota_K={quota_k}, candidate_draw_N={candidate_n})"
+        f"quota_K={quota_k}, candidate_draw_N={candidate_n}) ({timings['selection_s']:.2f}s)"
     )
 
     pending = selected_granules[~selected_granules["granule"].isin(completed_granules)].copy()
@@ -151,6 +183,7 @@ def build_stratified_dataset(
     existing_parts = sorted(Path(output_dir).glob("dataset_part_*.parquet"))
     part_counter = len(existing_parts)
 
+    t0 = time.perf_counter()
     warmup_tile = pending.iloc[0]["tile"] if not pending.empty else selected_granules.iloc[0]["tile"]
     sample_listing = ECOSTRESS_CMR_search(
         product="L3T_ETAUX",
@@ -165,7 +198,10 @@ def build_stratified_dataset(
     )
     _log(f"[5/6] Pre-warming GDAL /vsicurl/ Earthdata cookies (warmup_tile={warmup_tile})")
 
+    granule_durations: List[float] = []
+
     def _process_granule(row_dict: Dict[str, Any], idx: int, total: int, seed: int) -> pd.DataFrame:
+        g_t0 = time.perf_counter()
         gid = row_dict["granule"]
         tile = row_dict["tile"]
         orbit = row_dict["orbit"]
@@ -243,14 +279,19 @@ def build_stratified_dataset(
         )
         valid_df = sampled_df.dropna(subset=[l for l in layers if l in sampled_df.columns])
         accepted_df = valid_df.head(quota_k)
+        g_elapsed = time.perf_counter() - g_t0
+        with write_lock:
+            granule_durations.append(g_elapsed)
         _log(
             f"  [{idx + 1}/{total}] {gid}: extracted {len(sampled_df)} raw rows, "
-            f"{len(valid_df)} complete rows -> kept {len(accepted_df)}/{quota_k} samples"
+            f"{len(valid_df)} complete rows -> kept {len(accepted_df)}/{quota_k} samples ({g_elapsed:.2f}s)"
         )
         return accepted_df
 
     total_pending = len(pending)
     with configure_gdal_earthdata_env(session=session, warmup_url=warmup_url):
+        timings["cookie_warmup_s"] = time.perf_counter() - t0
+        t_extract = time.perf_counter()
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(
@@ -270,19 +311,62 @@ def build_stratified_dataset(
                             batch_df.to_csv(f"{part_stem}.csv", index=False)
                         _log(f"  [checkpoint] Saved {len(batch_df)} rows to {os.path.basename(part_stem)}.parquet")
                     _append_completed_manifest(manifest_path, gid)
+        timings["extraction_s"] = time.perf_counter() - t_extract
 
+    t0 = time.perf_counter()
     _log("[6/6] Aggregating Parquet partitions and computing coverage summary...")
     all_parts = sorted(Path(output_dir).glob("dataset_part_*.parquet"))
     full_df = pd.concat([pd.read_parquet(p) for p in all_parts], ignore_index=True) if all_parts else pd.DataFrame()
     coverage_summary = summarize_point_samples(full_df, layers=layers)
-    _log(f"[6/6] Done! Total valid samples collected: {len(full_df)}")
+    timings["aggregation_s"] = time.perf_counter() - t0
+    timings["total_s"] = time.perf_counter() - t_start
+
+    n_samples = len(full_df)
+    n_granules = len(selected_granules)
+    mean_granule_s = float(np.mean(granule_durations)) if granule_durations else timings["extraction_s"]
+    effective_granule_s = (
+        timings["extraction_s"] / total_pending if total_pending > 0 else mean_granule_s
+    )
+    samples_per_sec = n_samples / timings["extraction_s"] if timings["extraction_s"] > 0 else 0.0
+
+    # Extrapolation 1: Naive linear scaling at current samples/sec
+    linear_1m_s = (1_000_000 / samples_per_sec) if samples_per_sec > 0 else float("inf")
+
+    # Extrapolation 2: Realistic granule-amortized 1M run
+    # In a global run (~3,500-5,000 granules, K=200-285 pts/granule, 16-32 workers),
+    # HTTP open latency per COG is amortized across K points in one src.sample() call.
+    est_global_granules = 4_000
+    est_global_workers = max(max_workers, 16)
+    est_global_extract_s = est_global_granules * (mean_granule_s / est_global_workers)
+    est_global_cmr_s = (timings["cmr_search_s"] / max(1, len(tiles))) * 60  # ~60 regional bbox chunks
+    est_global_1m_s = est_global_extract_s + est_global_cmr_s
+
+    performance = {
+        "timings_s": {k: round(v, 3) for k, v in timings.items()},
+        "mean_granule_latency_s": round(mean_granule_s, 2),
+        "effective_wall_per_granule_s": round(effective_granule_s, 2),
+        "samples_per_second": round(samples_per_sec, 2),
+        "linear_1m_estimate_s": round(linear_1m_s, 1),
+        "linear_1m_estimate_human": _format_duration(linear_1m_s),
+        "amortized_global_1m_estimate_s": round(est_global_1m_s, 1),
+        "amortized_global_1m_estimate_human": _format_duration(est_global_1m_s),
+        "amortized_assumptions": {
+            "global_granules": est_global_granules,
+            "points_per_granule_K": math.ceil(1_000_000 / est_global_granules),
+            "workers": est_global_workers,
+        },
+    }
+
+    _log(
+        f"[6/6] Done! {n_samples} samples in {timings['total_s']:.2f}s "
+        f"({samples_per_sec:.2f} samples/s; amortized 1M estimate: {performance['amortized_global_1m_estimate_human']})"
+    )
 
     return {
-        "total_samples": len(full_df),
-        "selected_granules": len(selected_granules),
+        "total_samples": n_samples,
+        "selected_granules": n_granules,
         "n_cap": n_cap,
         "quota_k": quota_k,
         "coverage_summary": coverage_summary,
+        "performance": performance,
     }
-
-UQ_LAYERS = DEFAULT_STRATIFIED_LAYERS.copy()
