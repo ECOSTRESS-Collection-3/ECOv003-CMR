@@ -455,10 +455,10 @@ print(find_sentinel2_tile(-118.2437, 34.0522))  # '11SLT'
 
 Runnable end-to-end scripts are available in [`examples/`](examples/):
 
+* [`examples/download_granules_demo.py`](examples/download_granules_demo.py) — Downloading `L2T_LSTE` and `L2T_STARS` granules via `download_ECOSTRESS_granule()`.
 * [`examples/point_sampling_demo.py`](examples/point_sampling_demo.py) — Single-coordinate multi-product sampling (`L2T_LSTE` + `L2T_STARS`) with Kelvin-to-Celsius conversion and summary statistics.
 * [`examples/geodataframe_sampling_demo.py`](examples/geodataframe_sampling_demo.py) — Multi-site `GeoDataFrame` batch sampling across a date range using `sample_points_over_date_range()`.
 * [`examples/csv_to_geodataframe_demo.py`](examples/csv_to_geodataframe_demo.py) — Loading site coordinates and metadata from a CSV file, converting to `GeoDataFrame`, sampling all acquisitions, and exporting results to CSV.
-* [`POINT_SAMPLING_INTEGRATION.md`](POINT_SAMPLING_INTEGRATION.md) — Detailed technical notes on CRS handling, nodata masking, and product mappings.
 
 ---
 
