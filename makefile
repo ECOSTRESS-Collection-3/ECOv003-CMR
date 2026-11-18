@@ -1,5 +1,5 @@
 # Define the default Python version as a constant
-PYTHON_VERSION = 3.13
+PYTHON_VERSION = 3.14
 
 .PHONY: dist clean test build twine-upload remove-environment install uninstall reinstall environment
 
@@ -67,3 +67,6 @@ docker-remove:
 
 repomix:
 	npx repomix --ignore "**/*.ipynb,**/*.csv" --copy
+
+show-releases:
+	gh run list --workflow=python-publish.yml 
