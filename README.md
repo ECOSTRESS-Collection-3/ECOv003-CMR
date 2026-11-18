@@ -1,6 +1,6 @@
 # ECOSTRESS Collection 3 CMR Tools
 
-`ECOv003-CMR` searches NASA's [Common Metadata Repository (CMR)](https://cmr.earthdata.nasa.gov/) for ECOSTRESS Collection 3 granules, downloads granules, parses granule metadata, samples Cloud-Optimized GeoTIFF (COG) raster values at geographic points, and builds globally stratified uncertainty quantification (UQ) training datasets over `/vsicurl/`.
+`ECOv003-CMR` searches NASA's [Common Metadata Repository (CMR)](https://cmr.earthdata.nasa.gov/) for ECOSTRESS Collection 3 granules, downloads granules, parses granule metadata, samples Cloud-Optimized GeoTIFF (COG) raster values at geographic points, and builds globally or regionally stratified point-sample datasets over `/vsicurl/`.
 
 [![CI](https://github.com/ECOSTRESS-Collection-3/ECOv003-CMR/actions/workflows/ci.yml/badge.svg)](https://github.com/ECOSTRESS-Collection-3/ECOv003-CMR/actions/workflows/ci.yml)
 
@@ -15,7 +15,7 @@
 5. [Python API: Searching NASA CMR](#python-api-searching-nasa-cmr)
 6. [Python API: Downloading & Opening Granules](#python-api-downloading--opening-granules)
 7. [Python API: Point Sampling & `/vsicurl/` Batch Extraction](#python-api-point-sampling--vsicurl-batch-extraction)
-8. [Python API: Global Stratified UQ Training Dataset Builder](#python-api-global-stratified-uq-training-dataset-builder)
+8. [Python API: Global & Regional Stratified Dataset Builder](#python-api-global--regional-stratified-dataset-builder)
 9. [Python API: Granule ID, Filename & Tile Utilities](#python-api-granule-id-filename--tile-utilities)
 10. [Examples](#examples)
 11. [Development and Testing](#development-and-testing)
@@ -400,9 +400,9 @@ samples = sample_points_from_geodataframe(
 
 ---
 
-## Python API: Global Stratified UQ Training Dataset Builder
+## Python API: Global & Regional Stratified Dataset Builder
 
-`build_uq_training_dataset()` automates global, spatially uniform, seasonally balanced dataset generation across ECOSTRESS orbital coverage ($\pm 54^\circ$ latitude):
+`build_stratified_dataset()` automates global, spatially uniform, seasonally balanced dataset generation across ECOSTRESS orbital coverage ($\pm 54^\circ$ latitude):
 
 1. **Global Tile Discovery (`list_ecostress_land_tiles()`):** Enumerates all land-intersecting Sentinel-2 MGRS tiles within $[-54^\circ, 54^\circ]$ latitude.
 2. **Clear-Sky Multi-Product Filtering (`find_clear_sky_et_granules()`):** Identifies daytime clear-sky `L3T_JET` overpasses that have matching `L2T_LSTE`, `L3T_ETAUX`, and same-date `L2T_STARS` granules.
@@ -413,13 +413,13 @@ samples = sample_points_from_geodataframe(
 ```python
 from datetime import date
 import logging
-from ECOv003_CMR import build_uq_training_dataset, setup_earthdata_session
+from ECOv003_CMR import build_stratified_dataset, UQ_LAYERS, setup_earthdata_session
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 session = setup_earthdata_session()
 
-summary = build_uq_training_dataset(
-    output_dir="./uq_dataset_output",
+summary = build_stratified_dataset(
+    output_dir="./stratified_dataset_output",
     start_date=date(2026, 6, 1),
     end_date=date(2026, 6, 30),
     tiles=["11SLT", "11SPS", "52NHN"],  # Omit (tiles=None) to run across all global land tiles
@@ -427,6 +427,7 @@ summary = build_uq_training_dataset(
     min_granules_floor=1,
     dispersion_strategy="stratified_grid",
     max_workers=4,
+    layers=UQ_LAYERS,  # Optional; defaults to DEFAULT_STRATIFIED_LAYERS
     export_csv=True,
     session=session,
 )
@@ -464,7 +465,7 @@ print(find_sentinel2_tile(-118.2437, 34.0522))  # '11SLT'
 
 Runnable end-to-end scripts are available in [`examples/`](examples/):
 
-- [`examples/uq_dataset_sampling_demo.py`](examples/uq_dataset_sampling_demo.py) — Stratified UQ training dataset extraction with `/vsicurl/` byte-range reads, Parquet checkpointing, and layer coverage diagnostics.
+- [`examples/stratified_sampling_demo.py`](examples/stratified_sampling_demo.py) — Stratified multi-product dataset extraction with `/vsicurl/` byte-range reads, Parquet checkpointing, and layer coverage diagnostics.
 - [`examples/download_granules_demo.py`](examples/download_granules_demo.py) — Downloading `L2T_LSTE` and `L2T_STARS` granules via `download_ECOSTRESS_granule()`.
 - [`examples/point_sampling_demo.py`](examples/point_sampling_demo.py) — Single-coordinate multi-product sampling (`L2T_LSTE` + `L2T_STARS`) with Kelvin-to-Celsius conversion.
 - [`examples/geodataframe_sampling_demo.py`](examples/geodataframe_sampling_demo.py) — Multi-site `GeoDataFrame` batch sampling across a date range using `sample_points_over_date_range()`.

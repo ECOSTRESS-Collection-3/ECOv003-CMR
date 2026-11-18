@@ -27,7 +27,7 @@ from .tile_catalog import list_ecostress_land_tiles
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_UQ_LAYERS = [
+DEFAULT_STRATIFIED_LAYERS = [
     "PTJPLSMinst",
     "ETdaily",
     "ETuncertainty",
@@ -59,7 +59,7 @@ def _append_completed_manifest(manifest_path: str, granule_id: str) -> None:
         f.write(f"{granule_id}\n")
 
 
-def build_uq_training_dataset(
+def build_stratified_dataset(
     output_dir: str,
     start_date: Union[date, str],
     end_date: Union[date, str],
@@ -78,7 +78,7 @@ def build_uq_training_dataset(
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
-    Build the global, stratified ~1M-sample ECOSTRESS Collection 3 UQ training
+    Build a spatially and seasonally stratified ECOSTRESS Collection 3 point-sample
     dataset with incremental Parquet checkpointing, manifest resuming, and
     detailed pipeline logging.
     """
@@ -91,7 +91,7 @@ def build_uq_training_dataset(
     completed_granules = _load_completed_manifest(manifest_path)
 
     if layers is None:
-        layers = DEFAULT_UQ_LAYERS.copy()
+        layers = DEFAULT_STRATIFIED_LAYERS.copy()
 
     _log(f"[1/6] Configuring NASA Earthdata session (output_dir={output_dir})")
     if session is None:
@@ -284,3 +284,5 @@ def build_uq_training_dataset(
         "quota_k": quota_k,
         "coverage_summary": coverage_summary,
     }
+
+UQ_LAYERS = DEFAULT_STRATIFIED_LAYERS.copy()

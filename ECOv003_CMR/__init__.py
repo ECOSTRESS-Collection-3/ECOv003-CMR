@@ -17,6 +17,6 @@ from .stratified_sampling import (
     extract_valid_swath_mask,
     sample_granule_coordinates,
 )
-from .uq_dataset_builder import build_uq_training_dataset
+from .stratified_dataset_builder import build_stratified_dataset, DEFAULT_STRATIFIED_LAYERS, UQ_LAYERS
 
 __author__ = "Gregory H. Halverson"
