@@ -14,10 +14,11 @@ from .interpret_ECOSTRESS_URLs import interpret_ECOSTRESS_URLs
 
 logger = logging.getLogger(__name__)
 
+
 def ECOSTRESS_CMR_search(
         product: Union[str, List[str]],
         tile: Union[str, List[str]],
-        start_date: Union[date, str], 
+        start_date: Union[date, str],
         end_date: Union[date, str] = None,
         orbit: int = None,
         scene: int = None,
@@ -103,12 +104,20 @@ def ECOSTRESS_CMR_search(
     return pd.concat(frames, ignore_index=True)
 
 
+def _configure_cli_logging(quiet: bool = False) -> None:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.WARNING if quiet else logging.INFO,
+            format="%(message)s",
+        )
+
+
 def main():
     """Command-line interface wrapper for ECOSTRESS_CMR_search."""
     parser = argparse.ArgumentParser(
         description="Search the NASA CMR API for ECOSTRESS granules and map them to Sentinel-2 tiles."
     )
-    
+
     allowed_product_codes = sorted(CONCEPT_IDS)
     allowed_products = ", ".join(allowed_product_codes)
 
@@ -121,21 +130,24 @@ def main():
     parser.add_argument("-s", "--start-date", required=True, type=str,
                         metavar="YYYY-MM-DD",
                         help="Start date of the search period (YYYY-MM-DD).")
-    
+
     # Optional arguments
     parser.add_argument("-e", "--end-date", type=str, default=None,
                         metavar="YYYY-MM-DD",
                         help="End date of the search period (YYYY-MM-DD). Defaults to start-date.")
-    parser.add_argument("--orbit", type=int, default=None, 
+    parser.add_argument("--orbit", type=int, default=None,
                         help="Optional orbit number filter.")
-    parser.add_argument("--scene", type=int, default=None, 
+    parser.add_argument("--scene", type=int, default=None,
                         help="Optional scene number filter.")
-    parser.add_argument("-o", "--output", type=str, default=None, 
+    parser.add_argument("-o", "--output", type=str, default=None,
                         help="Path to save the output CSV file. If not provided, results print to console.")
-    parser.add_argument("--cmr-url", type=str, default=CMR_SEARCH_URL, 
+    parser.add_argument("--cmr-url", type=str, default=CMR_SEARCH_URL,
                         help="Custom base URL for the CMR search API.")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="Suppress informational progress output.")
 
     args = parser.parse_args()
+    _configure_cli_logging(quiet=args.quiet)
 
     selected_products = list(dict.fromkeys(args.product))
     selected_tiles = list(dict.fromkeys(args.tile))
@@ -150,7 +162,7 @@ def main():
         logger.info(
             f"searching for {', '.join(selected_products)} on {tile_label} {', '.join(selected_tiles)} {date_text}"
         )
-        
+
         df = ECOSTRESS_CMR_search(
             product=selected_products,
             tile=selected_tiles,
@@ -179,12 +191,11 @@ def main():
             granules = df["granule"].dropna().astype(str).tolist()
             ordered_unique_granules = list(dict.fromkeys(granules))
 
-            logger.info("Granules:")
             for granule in ordered_unique_granules:
-                logger.info(granule)
+                print(granule)
 
     except Exception as err:
-        logger.info(f"Error: {err}")
+        logger.error(f"Error: {err}")
         sys.exit(1)
 
 

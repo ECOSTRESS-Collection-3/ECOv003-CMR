@@ -1,13 +1,15 @@
 import argparse
 import sys
-from typing import List, Union
-from datetime import date
+from typing import List, Optional, Union
+from datetime import date, datetime
 import logging
 
 import pandas as pd
+import requests
 
 from ECOv003_granules import ECOSTRESSGranule
 
+from .authentication import setup_earthdata_session
 from .constants import *
 from .granule_ID import GranuleID
 from .download_ECOSTRESS_granule import download_ECOSTRESS_granule
@@ -15,6 +17,22 @@ from .ECOSTRESS_CMR_search import ECOSTRESS_CMR_search
 from .product_name_from_filename import product_name_from_filename
 
 logger = logging.getLogger(__name__)
+
+
+def _acquisition_date_from_granule_id(granule_id: GranuleID, fallback_date: Union[date, str]) -> Union[date, str]:
+    """Extract the acquisition date from a Collection 3 GranuleID string."""
+    parts = str(granule_id).split("_")
+    raw_date = None
+    if granule_id.product == "L2T_STARS" and len(parts) > 4:
+        raw_date = parts[4][:8]
+    elif len(parts) > 6:
+        raw_date = parts[6][:8]
+
+    if raw_date and len(raw_date) == 8 and raw_date.isdigit():
+        return datetime.strptime(raw_date, "%Y%m%d").date()
+
+    return fallback_date
+
 
 def download_ECOSTRESS(
         product: Union[str, List[str]],
@@ -25,7 +43,8 @@ def download_ECOSTRESS(
         scene: int = None,
         parent_directory: str = DOWNLOAD_DIRECTORY,
         CMR_file_listing_df: pd.DataFrame = None,
-        CMR_search_URL: str = CMR_SEARCH_URL) -> List[ECOSTRESSGranule]:
+        CMR_search_URL: str = CMR_SEARCH_URL,
+        session: Optional[requests.Session] = None) -> List[ECOSTRESSGranule]:
     """
     Searches for and downloads matching ECOSTRESS granules.
 
@@ -36,9 +55,10 @@ def download_ECOSTRESS(
     - end_date (Union[date, str], optional): End date for the search window. Defaults to start_date.
     - orbit (int, optional): The orbit number. Defaults to None.
     - scene (int, optional): The scene number. Defaults to None.
-    - parent_directory (str, optional): The directory to save the downloaded files. Defaults to ".".
+    - parent_directory (str, optional): The directory to save the downloaded files. Defaults to DOWNLOAD_DIRECTORY.
     - CMR_file_listing_df (pd.DataFrame, optional): Optional pre-fetched CMR listing. Defaults to None.
     - CMR_search_URL (str, optional): The URL for CMR search. Defaults to CMR_SEARCH_URL.
+    - session (requests.Session, optional): Authenticated NASA Earthdata session. Defaults to None.
 
     Returns:
     - List[ECOSTRESSGranule]: Downloaded ECOSTRESS granule objects.
@@ -88,6 +108,9 @@ def download_ECOSTRESS(
     if "granule" not in CMR_file_listing_df.columns:
         raise ValueError("CMR listing is missing required 'granule' column")
 
+    if session is None:
+        session = setup_earthdata_session()
+
     granule_names = list(dict.fromkeys(CMR_file_listing_df["granule"].dropna().astype(str).tolist()))
     downloaded = []
 
@@ -95,24 +118,34 @@ def download_ECOSTRESS(
         granule_listing = CMR_file_listing_df[CMR_file_listing_df["granule"] == granule_name]
         granule_id = GranuleID(granule_name)
         granule_product = product_name_from_filename(granule_name)
+        granule_date = _acquisition_date_from_granule_id(granule_id, start_date)
 
         granule = download_ECOSTRESS_granule(
             product=granule_product,
             tile=granule_id.tile,
-            aquisition_date=start_date,
+            acquisition_date=granule_date,
             orbit=granule_id.orbit,
             scene=granule_id.scene,
             parent_directory=parent_directory,
             CMR_file_listing_df=granule_listing,
             CMR_search_URL=CMR_search_URL,
+            session=session,
         )
         downloaded.append(granule)
 
     return downloaded
 
 
+def _configure_cli_logging(quiet: bool = False) -> None:
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.WARNING if quiet else logging.INFO,
+            format="%(message)s",
+        )
+
+
 def main():
-    """Command-line interface wrapper for download_ECOSTRESS_granule."""
+    """Command-line interface wrapper for download_ECOSTRESS."""
     parser = argparse.ArgumentParser(
         description="Download ECOSTRESS granules for a date range and open them as ECOSTRESSGranule objects."
     )
@@ -139,8 +172,12 @@ def main():
                         help="Parent directory where granule files are downloaded.")
     parser.add_argument("--cmr-url", type=str, default=CMR_SEARCH_URL,
                         help="Custom base URL for the CMR search API.")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="Suppress informational progress output.")
 
     args = parser.parse_args()
+    _configure_cli_logging(quiet=args.quiet)
+
     selected_products = list(dict.fromkeys(args.product))
     selected_tiles = list(dict.fromkeys(args.tile))
     tile_label = "tile" if len(selected_tiles) == 1 else "tiles"
@@ -174,10 +211,10 @@ def main():
 
         logger.info("Download complete.")
         for granule in downloaded:
-            logger.info(str(granule))
+            print(str(granule))
 
     except Exception as err:
-        logger.info(f"Error: {err}", file=sys.stderr)
+        logger.error(f"Error: {err}")
         sys.exit(1)
 
 

@@ -1,17 +1,19 @@
-
 import os
 from os import makedirs
 from os.path import exists, getsize, dirname, abspath, expanduser, join
 import logging
 import posixpath
+from typing import Optional
 import requests
-from tqdm.notebook import tqdm
+from tqdm.auto import tqdm
 
 import colored_logging as cl
 
+from .authentication import setup_earthdata_session
 from .exceptions import *
 
 logger = logging.getLogger(__name__)
+
 
 def expand_filename(filename: str) -> str:
     """
@@ -25,17 +27,21 @@ def expand_filename(filename: str) -> str:
     """
     return abspath(expanduser(filename))
 
+
 def download_file(
-        URL: str, 
+        URL: str,
         filename: str = None,
-        granule_directory: str = None) -> str:
+        granule_directory: str = None,
+        session: Optional[requests.Session] = None) -> str:
     """
-    Downloads a file from the given URL to the specified filename.
+    Downloads a file from the given URL to the specified filename using an
+    authenticated NASA Earthdata session.
 
     Args:
         URL (str): The URL of the file to download.
         filename (str, optional): The local filename to save the downloaded file. Defaults to None.
         granule_directory (str, optional): The directory to save the file if filename is not provided. Defaults to None.
+        session (requests.Session, optional): Authenticated session for NASA Earthdata. Defaults to setup_earthdata_session().
 
     Returns:
         str: The path to the downloaded file.
@@ -45,6 +51,8 @@ def download_file(
     """
     # If filename is not provided, construct it using the granule_directory and the basename of the URL
     if filename is None:
+        if granule_directory is None:
+            raise ValueError("Either filename or granule_directory must be provided")
         filename = join(granule_directory, posixpath.basename(URL))
 
     abs_filename = expand_filename(filename)
@@ -59,6 +67,9 @@ def download_file(
         logger.info(f"file already downloaded: {cl.file(filename)}")
         return filename
 
+    if session is None:
+        session = setup_earthdata_session()
+
     # Log the download start information
     logger.info(f"downloading: {cl.URL(URL)} -> {cl.file(filename)}")
     directory = dirname(abs_filename)
@@ -66,7 +77,7 @@ def download_file(
     partial_filename = f"{abs_filename}.download"
 
     try:
-        with requests.get(URL, stream=True) as r:
+        with session.get(URL, stream=True, allow_redirects=True) as r:
             r.raise_for_status()
             total = int(r.headers.get('content-length', 0))
             with open(partial_filename, 'wb') as f, tqdm(

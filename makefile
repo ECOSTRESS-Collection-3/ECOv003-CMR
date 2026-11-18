@@ -1,7 +1,7 @@
 # Define the default Python version as a constant
 PYTHON_VERSION = 3.13
 
-.PHONY: dist
+.PHONY: dist clean test build twine-upload remove-environment install uninstall reinstall environment
 
 PACKAGE_NAME = ECOv003-CMR
 ENVIRONMENT_NAME = $(PACKAGE_NAME)
@@ -17,9 +17,6 @@ clean:
 
 test:
 	pytest tests
-
-test-integration:
-	pytest test_drop_na.py test_parallel_performance.py
 
 build:
 	python -m build
@@ -67,3 +64,6 @@ docker-interactive:
 
 docker-remove:
 	docker rmi -f $(DOCKER_IMAGE_NAME)
+
+repomix:
+	npx repomix --ignore "**/*.ipynb,**/*.csv" --copy

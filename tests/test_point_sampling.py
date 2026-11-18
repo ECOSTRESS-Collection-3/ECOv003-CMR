@@ -11,7 +11,7 @@ import geopandas as gpd
 import numpy as np
 from datetime import datetime, date
 from shapely.geometry import Point
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch
 from rasterio.io import MemoryFile
 from rasterio.transform import from_origin
 
@@ -25,7 +25,7 @@ def test_import_point_sampling():
         sample_points_over_date_range,
         find_sentinel2_tile
     )
-    
+
     assert callable(setup_earthdata_session)
     assert callable(sample_point_from_url)
     assert callable(sample_points_from_geodataframe)
@@ -36,12 +36,10 @@ def test_import_point_sampling():
 def test_find_sentinel2_tile():
     """Test Sentinel-2 tile lookup for Los Angeles."""
     from ECOv003_CMR import find_sentinel2_tile
-    
-    # Downtown LA should be in tile 11SLT
+
     tile = find_sentinel2_tile(-118.2437, 34.0522)
     assert tile == "11SLT"
-    
-    # LAX Airport should also be in 11SLT
+
     tile = find_sentinel2_tile(-118.4085, 33.9416)
     assert tile == "11SLT"
 
@@ -49,21 +47,20 @@ def test_find_sentinel2_tile():
 def test_setup_earthdata_session_with_params():
     """Test setting up session with explicit credentials."""
     from ECOv003_CMR import setup_earthdata_session
-    
+
     session = setup_earthdata_session(
         username="testuser",
         password="testpass",
         require_auth=True
     )
-    
+
     assert session.auth == ("testuser", "testpass")
 
 
 def test_setup_earthdata_session_no_auth_optional():
     """Test setting up session without authentication when optional."""
     from ECOv003_CMR import setup_earthdata_session
-    
-    # Clear environment and mock .netrc to test no-auth scenario
+
     with patch.dict('os.environ', {}, clear=True):
         with patch('pathlib.Path.exists', return_value=False):
             session = setup_earthdata_session(require_auth=False)
@@ -73,7 +70,7 @@ def test_setup_earthdata_session_no_auth_optional():
 def test_setup_earthdata_session_no_auth_required():
     """Test that missing auth raises error when required."""
     from ECOv003_CMR import setup_earthdata_session
-    
+
     with patch.dict('os.environ', {}, clear=True):
         with patch('pathlib.Path.exists', return_value=False):
             with pytest.raises(RuntimeError, match="authentication required"):
@@ -83,15 +80,13 @@ def test_setup_earthdata_session_no_auth_required():
 def test_sample_points_from_geodataframe_validation():
     """Test input validation for GeoDataFrame sampling."""
     from ECOv003_CMR import sample_points_from_geodataframe
-    
-    # Create test GeoDataFrame without CRS
+
     data = {
         'datetime': [datetime(2025, 6, 15)],
         'geometry': [Point(-118.24, 34.05)]
     }
-    gdf = gpd.GeoDataFrame(data)  # No CRS
-    
-    # Should raise ValueError for missing CRS
+    gdf = gpd.GeoDataFrame(data)
+
     with pytest.raises(ValueError, match="must have a defined CRS"):
         sample_points_from_geodataframe(geometry=gdf)
 
@@ -99,14 +94,13 @@ def test_sample_points_from_geodataframe_validation():
 def test_sample_points_from_geodataframe_missing_columns():
     """Test error handling for missing required columns."""
     from ECOv003_CMR import sample_points_from_geodataframe
-    
-    # GeoDataFrame without datetime column
+
     data = {
         'site_id': ['A'],
         'geometry': [Point(-118.24, 34.05)]
     }
     gdf = gpd.GeoDataFrame(data, crs='EPSG:4326')
-    
+
     with pytest.raises(ValueError, match="Datetime column 'datetime' not found"):
         sample_points_from_geodataframe(geometry=gdf)
 
@@ -114,23 +108,17 @@ def test_sample_points_from_geodataframe_missing_columns():
 def test_sample_points_from_geodataframe_crs_reprojection():
     """Test that non-WGS84 GeoDataFrames are reprojected."""
     from ECOv003_CMR import sample_points_from_geodataframe
-    from unittest.mock import patch
-    
-    # Create GeoDataFrame in Web Mercator (EPSG:3857)
+
     data = {
         'datetime': [datetime(2025, 6, 15)],
-        'geometry': [Point(-13163264, 4035122)]  # LA in Web Mercator
+        'geometry': [Point(-13163264, 4035122)]
     }
     gdf = gpd.GeoDataFrame(data, crs='EPSG:3857')
-    
-    # Mock the search and session to avoid actual network calls
+
     with patch('ECOv003_CMR.point_sampling.setup_earthdata_session'):
         with patch('ECOv003_CMR.point_sampling.ECOSTRESS_CMR_search') as mock_search:
-            mock_search.return_value = pd.DataFrame()  # Empty results
-            
+            mock_search.return_value = pd.DataFrame()
             result = sample_points_from_geodataframe(geometry=gdf, verbose=False)
-            
-            # Should return empty DataFrame (no data found), but no errors
             assert isinstance(result, pd.DataFrame)
 
 
@@ -284,36 +272,57 @@ def test_sample_points_over_date_range_supports_etaux_only(monkeypatch, max_work
     assert results.loc[0, "Ta_C"] == pytest.approx(21.5)
 
 
-def test_sample_point_from_url_success():
-    """Test successful point sampling from URL (simplified)."""
-    # This is a complex integration that's difficult to mock fully.
-    # In practice, this would require actual raster data or a test fixture.
-    # For now, we just verify the function exists and has correct signature.
-    from ECOv003_CMR import sample_point_from_url
-    import inspect
-    
-    sig = inspect.signature(sample_point_from_url)
-    params = list(sig.parameters.keys())
-    
-    assert 'session' in params
-    assert 'url' in params
-    assert 'lon' in params
-    assert 'lat' in params
-    assert 'max_retries' in params
-    assert 'timeout' in params
+@pytest.mark.parametrize("max_workers", [1, 2])
+def test_sample_points_over_date_range_multi_point_stars_and_empty_tile(monkeypatch, max_workers):
+    """Ensure sequential (max_workers=1) and parallel paths sample all points even if the last point has no granules."""
+    import importlib
 
+    point_sampling = importlib.import_module("ECOv003_CMR.point_sampling")
+    stars_granule = "ECOv003_L2T_STARS_11SLT_20260601_01"
 
-def test_sample_point_from_url_outside_bounds():
-    """Test handling of point outside raster bounds (simplified)."""
-    # Similar to above, complex mocking is difficult.
-    # This would be better tested with integration tests using real data.
-    from ECOv003_CMR import sample_point_from_url
-    import inspect
-    
-    # Just verify the function signature and that it returns a tuple
-    sig = inspect.signature(sample_point_from_url)
-    assert sig.return_annotation != inspect.Signature.empty or True  # Has type hints or not
+    def mock_search(product, tile, **kwargs):
+        if tile == "11SLT" and product == "L2T_STARS":
+            return pd.DataFrame([
+                {
+                    "type": "GeoTIFF Data",
+                    "variable": "NDVI",
+                    "granule": stars_granule,
+                    "URL": "https://example.test/ndvi.tif",
+                    "orbit": None,
+                    "scene": None,
+                }
+            ])
+        return pd.DataFrame()
 
+    monkeypatch.setattr(point_sampling, "ECOSTRESS_CMR_search", mock_search)
+    monkeypatch.setattr(
+        point_sampling,
+        "sample_point_from_url",
+        lambda *args, **kwargs: (0.42, {"nodata": None}),
+    )
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    gdf = gpd.GeoDataFrame(
+        {
+            "site_id": ["site_a", "site_b", "site_empty"],
+            "geometry": [
+                Point(-118.24, 34.05),
+                Point(-118.40, 33.94),
+                Point(-120.00, 36.00),
+            ],
+        },
+        crs="EPSG:4326",
+    )
+
+    results = point_sampling.sample_points_over_date_range(
+        geometry=gdf,
+        start_date="2026-06-01",
+        end_date="2026-06-01",
+        layers=["NDVI"],
+        tile=["11SLT", "11SLT", "10SGF"],
+        session=Mock(),
+        max_workers=max_workers,
+        verbose=False,
+    )
+
+    assert sorted(results["site_id"].tolist()) == ["site_a", "site_b"]
+    assert np.allclose(results["NDVI"], 0.42)

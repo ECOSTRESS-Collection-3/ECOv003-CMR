@@ -91,7 +91,7 @@ from ECOv003_CMR import download_ECOSTRESS_granule
 granule = download_ECOSTRESS_granule(
     product="L2T_LSTE",
     tile="52NHN",
-    aquisition_date=date(2026, 6, 1),
+    acquisition_date=date(2026, 6, 1),
     parent_directory="./data",
 )
 print(granule)
@@ -107,7 +107,7 @@ ECOv003-download \
   --parent-directory ./data
 ```
 
-Downloading requires Earthdata authentication. The CLI accepts multiple products and tiles, date ranges, and optional orbit/scene filters; see `ECOv003-download --help`.
+Downloading requires Earthdata authentication (`~/.netrc`, `EARTHDATA_USERNAME`/`EARTHDATA_PASSWORD`, or an explicit `requests.Session` passed via `session=...`). The CLI accepts multiple products and tiles, date ranges, and optional orbit/scene filters; see `ECOv003-download --help`.
 
 ## Point sampling
 
