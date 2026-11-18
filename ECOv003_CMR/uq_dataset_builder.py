@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_UQ_LAYERS = [
     "PTJPLSMinst",
     "ETdaily",
-    "ETinstUncertainty",
+    "ETuncertainty",
     "ST_C",
     "LST_err",
     "EmisWB",

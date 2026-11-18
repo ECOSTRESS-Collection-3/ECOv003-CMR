@@ -71,9 +71,16 @@ LAYER_MAPPING = {
     'water': ('L3T_ETAUX', 'water'),
     # L3T_JET (Evapotranspiration & Ensemble Partitioning)
     'PTJPLSMinst': ('L3T_JET', 'PTJPLSMinst'),
+    'PTJPLSMdaily': ('L3T_JET', 'PTJPLSMdaily'),
+    'PTJPLSMcanopy': ('L3T_JET', 'PTJPLSMcanopy'),
+    'PTJPLSMsoil': ('L3T_JET', 'PTJPLSMsoil'),
+    'PTJPLSMinterception': ('L3T_JET', 'PTJPLSMinterception'),
     'ETdaily': ('L3T_JET', 'ETdaily'),
-    'ETinstUncertainty': ('L3T_JET', 'ETinstUncertainty'),
+    'ETuncertainty': ('L3T_JET', 'ETuncertainty'),
+    'ETinstUncertainty': ('L3T_JET', 'ETuncertainty'),
+    'STICJPLinst': ('L3T_JET', 'STICJPLinst'),
     'STICJPLdaily': ('L3T_JET', 'STICJPLdaily'),
+    'STICJPLcanopy': ('L3T_JET', 'STICJPLcanopy'),
     'BESSJPLdaily': ('L3T_JET', 'BESSJPLdaily'),
     'PMJPLdaily': ('L3T_JET', 'PMJPLdaily'),
     # L4T Products

@@ -20,7 +20,8 @@ from ECOv003_CMR.stratified_sampling import (
 def test_expanded_layer_mapping_includes_jet_and_uq_layers():
     assert LAYER_MAPPING["PTJPLSMinst"] == ("L3T_JET", "PTJPLSMinst")
     assert LAYER_MAPPING["ETdaily"] == ("L3T_JET", "ETdaily")
-    assert LAYER_MAPPING["ETinstUncertainty"] == ("L3T_JET", "ETinstUncertainty")
+    assert LAYER_MAPPING["ETuncertainty"] == ("L3T_JET", "ETuncertainty")
+    assert LAYER_MAPPING["PTJPLSMcanopy"] == ("L3T_JET", "PTJPLSMcanopy")
     assert LAYER_MAPPING["NDVI-UQ"] == ("L2T_STARS", "NDVI-UQ")
     assert LAYER_MAPPING["albedo-UQ"] == ("L2T_STARS", "albedo-UQ")
     assert LAYER_MAPPING["view_zenith"] == ("L2T_LSTE", "view_zenith")
