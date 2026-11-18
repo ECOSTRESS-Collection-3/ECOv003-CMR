@@ -15,7 +15,7 @@ L2T_LSTE_granule = download_ECOSTRESS_granule(
     orbit=47080,
     scene=14,
     tile="11SPS", 
-    aquisition_date="2026-10-24",
+    acquisition_date="2026-10-24",
     parent_directory=working_directory
 )
 
@@ -23,6 +23,6 @@ L2T_LSTE_granule = download_ECOSTRESS_granule(
 L2T_STARS_granule = download_ECOSTRESS_granule(
     product="L2T_STARS", 
     tile="11SPS", 
-    aquisition_date="2026-10-20",
+    acquisition_date="2026-10-20",
     parent_directory=working_directory
 )

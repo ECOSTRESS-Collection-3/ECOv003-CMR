@@ -1,15 +1,13 @@
-"""Debug script to see what STARS granules are found."""
-import pandas as pd
+"""Debug script to see what Collection 3 STARS granules are found."""
 from ECOv003_CMR import ECOSTRESS_CMR_search
 
-# Search for STARS products in the same date range
-tile = "18SUE"
-start_date = "2022-06-01"
-end_date = "2022-06-10"
+tile = "53PMK"
+start_date = "2026-06-01"
+end_date = "2026-06-10"
 
-print("="*80)
+print("=" * 80)
 print(f"Searching for L2T_STARS in tile {tile} from {start_date} to {end_date}")
-print("="*80)
+print("=" * 80)
 
 results = ECOSTRESS_CMR_search(
     product='L2T_STARS',
@@ -26,7 +24,7 @@ else:
     print("\nGranules found:")
     for granule in results['granule'].unique():
         print(f"  {granule}")
-    
+
     print("\nBreakdown by variable:")
     geotiff_data = results[results['type'] == 'GeoTIFF Data']
     for var in geotiff_data['variable'].unique():
@@ -35,10 +33,9 @@ else:
         for granule in var_files['granule'].unique():
             print(f"    - {granule}")
 
-# Also check LST for comparison
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print(f"Searching for L2T_LSTE in tile {tile} from {start_date} to {end_date}")
-print("="*80)
+print("=" * 80)
 
 lst_results = ECOSTRESS_CMR_search(
     product='L2T_LSTE',
@@ -54,10 +51,9 @@ else:
     print(f"\nUnique LST granules: {lst_results['granule'].nunique()}")
     print("\nLST Granules (dates):")
     for granule in sorted(lst_results['granule'].unique()):
-        # Extract date from granule name
         parts = granule.split('_')
         if len(parts) > 6:
             timestamp = parts[6]
-            date = timestamp[:8]
+            date_str = timestamp[:8]
             print(f"  {granule}")
-            print(f"    Date: {date}")
+            print(f"    Date: {date_str}")
