@@ -67,3 +67,6 @@ docker-interactive:
 
 docker-remove:
 	docker rmi -f $(DOCKER_IMAGE_NAME)
+
+repomix:
+	npx repomix --ignore "**/*.ipynb,**/*.csv" --copy
