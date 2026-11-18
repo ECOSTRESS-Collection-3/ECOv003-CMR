@@ -1,50 +1,53 @@
-from typing import List
+from typing import Any, Dict, List, Optional
 import posixpath
 
 import pandas as pd
+import requests
 
 from .variable_from_filename import variable_from_filename
 from .granule_ID_from_filename import granule_ID_from_filename
 
+
+def fetch_granule_metadata(
+    json_url: str,
+    session: Optional[requests.Session] = None,
+    timeout: int = 30,
+) -> Dict[str, Any]:
+    """Inspect a per-granule .json metadata sidecar for cloud fraction and QA flags."""
+    requester = session.get if session is not None else requests.get
+    response = requester(json_url, allow_redirects=True, timeout=timeout)
+    response.raise_for_status()
+    payload = response.json()
+
+    product_meta = payload.get("ProductMetadata", payload.get("Product Metadata", {}))
+    standard_meta = payload.get("StandardMetadata", payload.get("Standard Metadata", {}))
+
+    cloud_fraction = (
+        product_meta.get("QAPercentCloudCover")
+        or product_meta.get("CloudCover")
+        or standard_meta.get("CloudCover")
+    )
+    return {
+        "cloud_cover": float(cloud_fraction) if cloud_fraction is not None else None,
+        "product_metadata": product_meta,
+        "standard_metadata": standard_meta,
+    }
+
+
 def interpret_ECOSTRESS_URLs(
         URLs: List[str],
         orbit: int = None,
-        scene: int = None) -> pd.DataFrame:
+        scene: int = None,
+        entry_metadata: Optional[List[Dict[str, Any]]] = None) -> pd.DataFrame:
     """
     Parse and organize ECOSTRESS file URLs into a structured DataFrame.
-    
-    This function extracts metadata from ECOSTRESS granule file URLs including
-    product names, variable names, orbit/scene/tile identifiers, and file types.
-    Results can be optionally filtered by orbit and scene numbers.
-    
-    Parameters
-    ----------
-    URLs : List[str]
-        List of ECOSTRESS granule file URLs to interpret.
-    orbit : int, optional
-        If provided, filter results to only include this orbit number.
-    scene : int, optional
-        If provided, filter results to only include this scene number.
-    
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with columns:
-        - product: ECOSTRESS product name
-        - variable: Variable name (for data files)
-        - orbit: Orbit number
-        - scene: Scene number
-        - tile: Tile identifier
-        - type: File type (JSON Metadata, GeoTIFF Data, GeoJPEG Preview, or GeoJPEG Metadata)
-        - granule: Full granule identifier string
-        - filename: Base filename
-        - URL: Full URL
-    
-    Raises
-    ------
-    ValueError
-        If a URL contains a filename with an unrecognized file extension.
     """
+    meta_by_url = {}
+    if entry_metadata:
+        for item in entry_metadata:
+            if "URL" in item:
+                meta_by_url[item["URL"]] = item
+
     records = []
 
     for URL in URLs:
@@ -52,46 +55,48 @@ def interpret_ECOSTRESS_URLs(
         variable = ""
 
         granule_ID = granule_ID_from_filename(filename)
-        
-        # Determine file type and granule name based on filename
+
         if filename.endswith(".json"):
-            type = "JSON Metadata"
+            file_type = "JSON Metadata"
         elif filename.endswith(".tif"):
-            type = "GeoTIFF Data"
+            file_type = "GeoTIFF Data"
         elif filename.endswith(".jpeg.aux.xml"):
-            type = "GeoJPEG Metadata"
+            file_type = "GeoJPEG Metadata"
         elif filename.endswith(".jpeg"):
-            type = "GeoJPEG Preview"
+            file_type = "GeoJPEG Preview"
         else:
             raise ValueError(f"Unknown file type for {filename}")
 
-        # Extract variable name from filename for data files
         if filename.endswith((".tif", ".jpeg", ".jpeg.aux.xml")):
             variable = variable_from_filename(filename)
 
+        extra = meta_by_url.get(URL, {})
         records.append({
             "product": granule_ID.product,
             "variable": variable,
-            "orbit": granule_ID.orbit, 
-            "scene": granule_ID.scene, 
-            "tile": granule_ID.tile, 
-            "type": type,
+            "orbit": granule_ID.orbit,
+            "scene": granule_ID.scene,
+            "tile": granule_ID.tile,
+            "type": file_type,
             "granule": str(granule_ID),
             "filename": filename,
-            "URL": URL
+            "URL": URL,
+            "cloud_cover": extra.get("cloud_cover"),
+            "acquisition_datetime": extra.get("acquisition_datetime"),
         })
 
-    # Create a pandas DataFrame from the records
     df = pd.DataFrame(records, columns=[
-        "product", 
-        "variable", 
-        "orbit", 
+        "product",
+        "variable",
+        "orbit",
         "scene",
-        "tile", 
-        "type", 
-        "granule", 
-        "filename", 
-        "URL"
+        "tile",
+        "type",
+        "granule",
+        "filename",
+        "URL",
+        "cloud_cover",
+        "acquisition_datetime",
     ])
 
     if orbit is not None:

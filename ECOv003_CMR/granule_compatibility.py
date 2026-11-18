@@ -1,6 +1,6 @@
 from glob import glob
-from os.path import basename, join, normpath
-from typing import List, Optional
+from os.path import basename, exists, join, normpath
+from typing import List
 from zipfile import ZipFile
 
 from ECOv003_granules import ECOSTRESSGranule
@@ -70,12 +70,23 @@ COLLECTION_3_GRANULE_CLASSES = {
 
 def open_ECOSTRESS_granule(
         filename: str,
-        **kwargs) -> Optional[ECOSTRESSGranule]:
+        **kwargs) -> ECOSTRESSGranule:
     """Open Collection 3 granules with corrected filename and directory handling."""
     filename = normpath(filename)
+    if not exists(filename):
+        raise FileNotFoundError(f"ECOSTRESS granule path does not exist: {filename}")
+
     filename_base = basename(filename)
+    granule = None
     for prefix, granule_class in COLLECTION_3_GRANULE_CLASSES.items():
         if filename_base.startswith(prefix):
-            return granule_class(product_location=filename, **kwargs)
+            granule = granule_class(product_location=filename, **kwargs)
+            break
 
-    return open_granule_from_library(filename, **kwargs)
+    if granule is None:
+        granule = open_granule_from_library(filename, **kwargs)
+
+    if not isinstance(granule, ECOSTRESSGranule):
+        raise ValueError(f"Unrecognized or unsupported ECOSTRESS granule: {filename}")
+
+    return granule

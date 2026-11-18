@@ -1,4 +1,3 @@
-
 from os.path import join
 
 # Default local storage directory for Collection 3
@@ -32,6 +31,16 @@ L4T_ESI_CONCEPT_ID = "C4057232495-LPCLOUD"
 
 L4T_WUE_DOI = "10.5067/ECOSTRESS/ECO_L4T_WUE.003"
 L4T_WUE_CONCEPT_ID = "C4057232498-LPCLOUD"
+
+COLLECTION_3_DOIS = {
+    "L1CT_RAD": L1CT_RAD_DOI,
+    "L2T_LSTE": L2T_LSTE_DOI,
+    "L2T_STARS": L2T_STARS_DOI,
+    "L3T_ETAUX": L3T_ETAUX_DOI,
+    "L3T_JET": L3T_JET_DOI,
+    "L4T_ESI": L4T_ESI_DOI,
+    "L4T_WUE": L4T_WUE_DOI,
+}
 
 # Comprehensive map of all supported Collection 3 Concept IDs
 CONCEPT_IDS = {
