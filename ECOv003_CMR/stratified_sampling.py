@@ -1,7 +1,11 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
+import hashlib
 import logging
 import math
+import os
+from pathlib import Path
+import shutil
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
@@ -89,6 +93,21 @@ def _iter_temporal_chunks(
     return chunks
 
 
+def _cmr_task_cache_path(
+    cache_dir: str,
+    prod: str,
+    bbox: Tuple[float, float, float, float],
+    c_start: date,
+    c_end: date,
+    max_cloud_cover: Optional[float],
+    region_tiles: Set[str],
+) -> str:
+    digest = hashlib.sha256(
+        f"{prod}|{bbox}|{c_start}|{c_end}|{max_cloud_cover}|{','.join(sorted(region_tiles))}".encode("utf-8")
+    ).hexdigest()[:20]
+    return os.path.join(cache_dir, f"cmr_{prod}_{c_start}_{c_end}_{digest}.parquet")
+
+
 def find_clear_sky_et_granules(
     tiles: List[str],
     start_date: Union[date, str],
@@ -98,16 +117,17 @@ def find_clear_sky_et_granules(
     CMR_search_URL: str = CMR_SEARCH_URL,
     session: Optional[requests.Session] = None,
     regional_batch_threshold: int = 25,
-    cmr_workers: int = 8,
+    cmr_workers: int = 6,
+    cmr_cache_dir: Optional[str] = None,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """
     Verify candidate daytime clear-sky L3T_JET overpasses that have matching
     (orbit, scene, tile, timestamp) L2T_LSTE and L3T_ETAUX granules plus a
     same-date (tile, YYYYMMDD) L2T_STARS granule, caching all variable GeoTIFF URLs.
-    Automatically switches to concurrent regional WGS84 bounding-box + temporal-chunked
-    CMR queries with live progress logging and tqdm progress bars when
-    len(tiles) > regional_batch_threshold.
+    Automatically switches to concurrent, socket-timeout-hardened regional WGS84
+    bounding-box + temporal-chunked CMR queries with incremental task checkpointing
+    when len(tiles) > regional_batch_threshold.
     """
     required_products = ["L3T_JET", "L2T_LSTE", "L3T_ETAUX", "L2T_STARS"]
     if extra_products:
@@ -137,6 +157,9 @@ def find_clear_sky_et_granules(
             for c_start, c_end in temporal_chunks
         ]
 
+        if cmr_cache_dir:
+            os.makedirs(cmr_cache_dir, exist_ok=True)
+
         if verbose:
             logger.info(
                 f"Querying CMR across {len(regions)} regional boxes x "
@@ -146,6 +169,17 @@ def find_clear_sky_et_granules(
 
         def _query_chunk(task):
             prod, concept_id, bbox, region_tiles, c_start, c_end = task
+            task_file = (
+                _cmr_task_cache_path(cmr_cache_dir, prod, bbox, c_start, c_end, max_cloud_cover, region_tiles)
+                if cmr_cache_dir
+                else None
+            )
+            if task_file and os.path.exists(task_file):
+                try:
+                    return prod, pd.read_parquet(task_file), True
+                except Exception:
+                    pass
+
             entries = ECOSTRESS_CMR_search_entries(
                 concept_ID=concept_id,
                 bounding_box=bbox,
@@ -157,15 +191,23 @@ def find_clear_sky_et_granules(
                 session=session,
             )
             if not entries:
-                return prod, pd.DataFrame()
-            df_chunk = interpret_ECOSTRESS_URLs(
-                URLs=[e["URL"] for e in entries],
-                entry_metadata=entries,
-            )
-            return prod, df_chunk
+                df_chunk = pd.DataFrame()
+            else:
+                df_chunk = interpret_ECOSTRESS_URLs(
+                    URLs=[e["URL"] for e in entries],
+                    entry_metadata=entries,
+                )
+
+            if task_file:
+                tmp_file = f"{task_file}.tmp.{os.getpid()}"
+                df_chunk.to_parquet(tmp_file, index=False)
+                os.replace(tmp_file, task_file)
+
+            return prod, df_chunk, False
 
         frames: List[pd.DataFrame] = []
         total_assets = 0
+        cached_hits = 0
         milestone_step = max(1, len(tasks) // 10)
 
         with logging_redirect_tqdm(), ThreadPoolExecutor(
@@ -179,11 +221,17 @@ def find_clear_sky_et_granules(
                 disable=not verbose,
             ) as pbar:
                 for completed_idx, future in enumerate(as_completed(futures), start=1):
-                    _, df_chunk = future.result()
+                    _, df_chunk, from_cache = future.result()
+                    if from_cache:
+                        cached_hits += 1
                     if not df_chunk.empty:
                         frames.append(df_chunk)
                         total_assets += len(df_chunk)
-                    pbar.set_postfix(assets=f"{total_assets:,}", refresh=False)
+                    pbar.set_postfix(
+                        assets=f"{total_assets:,}",
+                        cached=cached_hits,
+                        refresh=False,
+                    )
                     pbar.update(1)
                     if verbose and (completed_idx % milestone_step == 0 or completed_idx == len(tasks)):
                         logger.info(
@@ -248,7 +296,10 @@ def find_clear_sky_et_granules(
             meta["variable_urls"] = merged_urls
             complete_rows.append(meta)
 
-    return pd.DataFrame(complete_rows)
+    result_df = pd.DataFrame(complete_rows)
+    if cmr_cache_dir and os.path.isdir(cmr_cache_dir):
+        shutil.rmtree(cmr_cache_dir, ignore_errors=True)
+    return result_df
 
 
 def select_stratified_granules(

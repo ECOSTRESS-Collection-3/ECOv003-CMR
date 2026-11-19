@@ -234,7 +234,8 @@ def build_stratified_dataset(
             max_cloud_cover=max_cloud_cover,
             extra_products=extra_products,
             session=session,
-            cmr_workers=max(1, min(8, max_workers)),
+            cmr_workers=max(1, min(6, max_workers)),
+            cmr_cache_dir=os.path.join(output_dir, "cmr_task_cache"),
             verbose=verbose,
         )
         if not candidate_granules.empty:

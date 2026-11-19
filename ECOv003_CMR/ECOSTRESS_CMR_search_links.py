@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import requests
@@ -12,27 +13,63 @@ from .granule_ID_from_filename import granule_ID_from_filename
 
 logger = logging.getLogger(__name__)
 
+_TRANSIENT_CMR_STATUS = {429, 500, 502, 503, 504}
+_THREAD_LOCAL = threading.local()
+
+
+def _get_cmr_session(session: Optional[requests.Session] = None) -> requests.Session:
+    """Return an unauthenticated per-thread requests.Session for public CMR search endpoints."""
+    if session is not None and not getattr(session, "auth", None):
+        return session
+    local_sess = getattr(_THREAD_LOCAL, "cmr_session", None)
+    if local_sess is None:
+        local_sess = requests.Session()
+        _THREAD_LOCAL.cmr_session = local_sess
+    return local_sess
+
 
 def _request_with_backoff(
     url: str,
     params: Dict[str, Any],
     headers: Dict[str, str],
     session: Optional[requests.Session] = None,
-    max_retries: int = 4,
+    max_retries: int = 5,
     backoff_base: float = 1.5,
+    timeout: Tuple[float, float] = (15.0, 60.0),
 ) -> requests.Response:
-    requester = session.get if (session is not None and not getattr(session, "auth", None)) else requests.get
+    """
+    Execute a CMR GET request with explicit (connect, read) socket timeouts and
+    retry backoff on transient HTTP errors, timeouts, and dropped connections so
+    worker threads never hang indefinitely on stalled sockets.
+    """
+    use_plain_get = (
+        session is None
+        and getattr(requests.get, "__module__", "") != "requests.api"
+    )
+    requester = requests.get if use_plain_get else _get_cmr_session(session).get
+
     for attempt in range(max_retries):
-        response = requester(url, params=params, headers=headers)
-        if getattr(response, "status_code", 200) in (429, 503) and attempt < max_retries - 1:
-            retry_after = response.headers.get("Retry-After")
-            delay = float(retry_after) if retry_after else backoff_base ** (attempt + 1)
+        try:
+            if use_plain_get:
+                response = requester(url, params=params, headers=headers)
+            else:
+                response = requester(url, params=params, headers=headers, timeout=timeout)
+            status = getattr(response, "status_code", 200)
+            if status in _TRANSIENT_CMR_STATUS and attempt < max_retries - 1:
+                retry_after = response.headers.get("Retry-After") if hasattr(response, "headers") else None
+                delay = float(retry_after) if retry_after else backoff_base ** (attempt + 1)
+                logger.warning(f"CMR transient HTTP {status} (attempt {attempt + 1}/{max_retries}); retrying in {delay:.1f}s")
+                time.sleep(delay)
+                continue
+            response.raise_for_status()
+            return response
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            if attempt >= max_retries - 1:
+                raise
+            delay = backoff_base ** (attempt + 1)
+            logger.warning(f"CMR request timeout/connection reset ({exc}); retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
             time.sleep(delay)
-            continue
-        response.raise_for_status()
-        return response
-    response.raise_for_status()
-    return response
+    raise RuntimeError(f"CMR request failed after {max_retries} retries: {url}")
 
 
 def ECOSTRESS_CMR_search_entries(
