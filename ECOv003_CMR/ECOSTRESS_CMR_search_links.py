@@ -1,12 +1,16 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, timedelta
 import logging
 import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
-import requests
-from datetime import date
-from dateutil import parser
 
+from dateutil import parser
+import pandas as pd
+import requests
 from sentinel_tiles import sentinel_tiles
+from tqdm.auto import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from .constants import CMR_SEARCH_URL
 from .granule_ID_from_filename import granule_ID_from_filename
@@ -74,6 +78,172 @@ def _request_with_backoff(
             )
             time.sleep(delay)
     raise RuntimeError(f"CMR request failed after {max_retries} retries: {url}")
+
+
+def _split_date_chunks(
+    start_date: date,
+    end_date: date,
+    chunk_days: Optional[int],
+) -> List[Tuple[date, date]]:
+    if chunk_days is None or chunk_days <= 0:
+        return [(start_date, end_date)]
+    chunks: List[Tuple[date, date]] = []
+    cursor = start_date
+    while cursor <= end_date:
+        c_end = min(end_date, cursor + timedelta(days=chunk_days - 1))
+        chunks.append((cursor, c_end))
+        cursor = c_end + timedelta(days=1)
+    return chunks
+
+
+def search_granule_catalog_umm(
+    concept_ID: str,
+    start_date: Union[date, str],
+    end_date: Union[date, str],
+    max_cloud_cover: Optional[float] = None,
+    allowed_tiles: Optional[Set[str]] = None,
+    chunk_days: Optional[int] = 31,
+    max_workers: int = 8,
+    CMR_search_URL: str = CMR_SEARCH_URL,
+    session: Optional[requests.Session] = None,
+    desc: Optional[str] = None,
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """
+    Enumerate Collection 3 granule metadata via NASA CMR's lightweight UMM-JSON
+    endpoint (granules.umm_json), omitting verbose asset link arrays (~80% smaller
+    payloads) and avoiding overlapping spatial bounding-box duplicates.
+    """
+    if isinstance(start_date, str):
+        start_date = parser.parse(start_date).date()
+    if end_date is None:
+        end_date = start_date
+    elif isinstance(end_date, str):
+        end_date = parser.parse(end_date).date()
+
+    umm_url = f"{CMR_search_URL}granules.umm_json"
+    chunks = _split_date_chunks(start_date, end_date, chunk_days)
+    target_tiles = set(allowed_tiles) if allowed_tiles is not None else None
+
+    def _fetch_window(window: Tuple[date, date]) -> List[Dict[str, Any]]:
+        w_start, w_end = window
+        params: Dict[str, Any] = {
+            "concept_id": concept_ID,
+            "temporal": f"{w_start}T00:00:00Z,{w_end}T23:59:59Z",
+            "page_size": 2000,
+        }
+        if max_cloud_cover is not None:
+            params["cloud_cover"] = f"0,{max_cloud_cover}"
+
+        rows: List[Dict[str, Any]] = []
+        headers: Dict[str, str] = {}
+        previous_search_after: Optional[str] = None
+
+        while True:
+            response = _request_with_backoff(
+                umm_url, params=params, headers=headers, session=session
+            )
+            items = response.json().get("items", [])
+            if not items:
+                break
+
+            for item in items:
+                umm = item.get("umm", {})
+                granule_ur = umm.get("GranuleUR", "")
+                if not granule_ur:
+                    continue
+                parts = granule_ur.split("_")
+                product = "_".join(parts[1:3]) if len(parts) > 2 else None
+                if product == "L2T_STARS":
+                    if len(parts) <= 4:
+                        continue
+                    orbit = None
+                    scene = None
+                    tile = parts[3]
+                    ts = parts[4]
+                else:
+                    if len(parts) <= 6:
+                        continue
+                    orbit = int(parts[3]) if parts[3].isdigit() else None
+                    scene = int(parts[4]) if parts[4].isdigit() else None
+                    tile = parts[5]
+                    ts = parts[6]
+
+                if target_tiles is not None and tile not in target_tiles:
+                    continue
+
+                raw_cc = umm.get("CloudExtent", {}).get("CloudCover")
+                cloud_cover = float(raw_cc) if raw_cc is not None else None
+                if (
+                    max_cloud_cover is not None
+                    and cloud_cover is not None
+                    and cloud_cover > max_cloud_cover
+                ):
+                    continue
+
+                range_dt = umm.get("TemporalExtent", {}).get("RangeDateTime", {})
+                rows.append(
+                    {
+                        "granule": granule_ur,
+                        "product": product,
+                        "orbit": orbit,
+                        "scene": scene,
+                        "tile": tile,
+                        "timestamp": ts,
+                        "date_str": ts[:8],
+                        "time_start": range_dt.get("BeginningDateTime"),
+                        "cloud_cover": cloud_cover,
+                    }
+                )
+
+            search_after = response.headers.get("CMR-Search-After")
+            if not search_after:
+                break
+            if search_after == previous_search_after:
+                raise RuntimeError("CMR repeated a Search-After token; stopping pagination")
+            previous_search_after = search_after
+            headers = {"CMR-Search-After": search_after}
+
+        return rows
+
+    all_rows: List[Dict[str, Any]] = []
+    if max_workers > 1 and len(chunks) > 1:
+        with logging_redirect_tqdm(), ThreadPoolExecutor(
+            max_workers=min(max_workers, len(chunks))
+        ) as executor:
+            futures = [executor.submit(_fetch_window, w) for w in chunks]
+            with tqdm(
+                total=len(chunks),
+                desc=desc or f"CMR UMM ({concept_ID})",
+                unit="chunk",
+                dynamic_ncols=True,
+                disable=not verbose,
+            ) as pbar:
+                for future in as_completed(futures):
+                    chunk_rows = future.result()
+                    all_rows.extend(chunk_rows)
+                    pbar.set_postfix(granules=f"{len(all_rows):,}", refresh=False)
+                    pbar.update(1)
+    else:
+        for w in chunks:
+            all_rows.extend(_fetch_window(w))
+
+    columns = [
+        "granule",
+        "product",
+        "orbit",
+        "scene",
+        "tile",
+        "timestamp",
+        "date_str",
+        "time_start",
+        "cloud_cover",
+    ]
+    if not all_rows:
+        return pd.DataFrame(columns=columns)
+
+    df = pd.DataFrame(all_rows, columns=columns)
+    return df.drop_duplicates(subset=["granule"]).reset_index(drop=True)
 
 
 def _extract_matching_links(

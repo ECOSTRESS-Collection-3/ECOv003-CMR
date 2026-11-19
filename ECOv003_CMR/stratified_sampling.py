@@ -1,10 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, timedelta
-import hashlib
+from datetime import date
 import logging
 import math
-import os
-import shutil
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
@@ -13,13 +10,12 @@ import rasterio
 from rasterio.crs import CRS
 from rasterio.warp import transform
 import requests
-from sentinel_tiles import sentinel_tiles
 from tqdm.auto import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 from .ECOSTRESS_CMR_search import ECOSTRESS_CMR_search
 from .ECOSTRESS_CMR_search_links import (
-    ECOSTRESS_CMR_search_entries,
+    search_granule_catalog_umm,
     search_granules_by_name_patterns,
 )
 from .constants import CMR_SEARCH_URL, CONCEPT_IDS
@@ -37,70 +33,139 @@ def _extract_granule_join_keys(granule: str) -> Tuple[str, Optional[int], Option
     return product, int(parts[3]), int(parts[4]), parts[5], parts[6]
 
 
-def _tile_bounds_wgs84(tile: str) -> Tuple[float, float, float, float]:
-    """Return (minx, miny, maxx, maxy) WGS84 bounds for a Sentinel-2 MGRS tile."""
-    if hasattr(sentinel_tiles, "footprint"):
-        return sentinel_tiles.footprint(tile).bounds
-    grid_obj = sentinel_tiles.grid(tile)
-    if hasattr(grid_obj, "boundary_latlon"):
-        return grid_obj.boundary_latlon.bounds
-    if hasattr(grid_obj, "bounds"):
-        return grid_obj.bounds
-    centroid = grid_obj.centroid_latlon
-    return (centroid.x - 0.5, centroid.y - 0.5, centroid.x + 0.5, centroid.y + 0.5)
-
-
-def _cluster_tiles_to_regional_boxes(
-    tiles: Sequence[str],
-    deg_step: float = 15.0,
-) -> List[Tuple[Tuple[float, float, float, float], Set[str]]]:
-    """
-    Group MGRS tiles into compact WGS84 regional bounding boxes (default 15 deg)
-    so each CMR spatial query stays shallow (1-2 pages) with fast response times.
-    """
-    buckets: Dict[Tuple[int, int], List[Tuple[str, Tuple[float, float, float, float]]]] = {}
-    for tile in tiles:
-        minx, miny, maxx, maxy = _tile_bounds_wgs84(tile)
-        cx = 0.5 * (minx + maxx)
-        cy = 0.5 * (miny + maxy)
-        bx = int(math.floor((cx + 180.0) / deg_step))
-        by = int(math.floor((cy + 90.0) / deg_step))
-        buckets.setdefault((bx, by), []).append((tile, (minx, miny, maxx, maxy)))
-
-    regions: List[Tuple[Tuple[float, float, float, float], Set[str]]] = []
-    for items in buckets.values():
-        region_tiles = {t for t, _ in items}
-        minx = max(-180.0, min(b[0] for _, b in items))
-        miny = max(-90.0, min(b[1] for _, b in items))
-        maxx = min(180.0, max(b[2] for _, b in items))
-        maxy = min(90.0, max(b[3] for _, b in items))
-        regions.append(((minx, miny, maxx, maxy), region_tiles))
-    return regions
-
-
-def _iter_temporal_chunks(
-    start_date: Union[date, str],
-    end_date: Union[date, str],
-    chunk_days: int = 31,
-) -> List[Tuple[date, date]]:
-    s_date = pd.to_datetime(start_date).date()
-    e_date = pd.to_datetime(end_date).date()
-    chunks: List[Tuple[date, date]] = []
-    cursor = s_date
-    while cursor <= e_date:
-        chunk_end = min(e_date, cursor + timedelta(days=chunk_days - 1))
-        chunks.append((cursor, chunk_end))
-        cursor = chunk_end + timedelta(days=1)
-    return chunks
-
-
-def _cmr_task_cache_path(cache_dir: str, prefix: str, key_material: str) -> str:
-    digest = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:24]
-    return os.path.join(cache_dir, f"{prefix}_{digest}.parquet")
-
-
 def _batched(items: Sequence[Any], batch_size: int) -> List[Sequence[Any]]:
     return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
+
+
+def resolve_granule_asset_urls(
+    granules_df: pd.DataFrame,
+    extra_products: Optional[List[str]] = None,
+    max_cloud_cover: Optional[float] = 20.0,
+    CMR_search_URL: str = CMR_SEARCH_URL,
+    session: Optional[requests.Session] = None,
+    cmr_workers: int = 8,
+    pattern_batch_size: int = 150,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Resolve GeoTIFF asset URLs across L3T_JET, L2T_LSTE, L3T_ETAUX, L2T_STARS
+    (and any extra_products) strictly for the supplied candidate/selected rows
+    using exact wildcard readable_granule_name[] batches.
+    """
+    if granules_df.empty:
+        return granules_df.copy()
+
+    if "variable_urls" in granules_df.columns and granules_df["variable_urls"].apply(
+        lambda d: isinstance(d, dict) and len(d) > 0
+    ).all():
+        return granules_df.copy()
+
+    companion_products = ["L2T_LSTE", "L3T_ETAUX", "L2T_STARS"]
+    if extra_products:
+        for prod in extra_products:
+            if prod != "L3T_JET" and prod not in companion_products:
+                companion_products.append(prod)
+    all_products = ["L3T_JET"] + companion_products
+
+    overpass_stems = sorted(
+        {
+            f"{int(r.orbit):05d}_{int(r.scene):03d}_{r.tile}_{r.timestamp}"
+            for r in granules_df.itertuples()
+        }
+    )
+    stars_stems = sorted({f"{r.tile}_{str(r.date_str)[:8]}" for r in granules_df.itertuples()})
+
+    tasks: List[Tuple[str, List[str]]] = []
+    for prod in all_products:
+        if prod == "L2T_STARS":
+            patterns = [f"ECOv003_L2T_STARS_{stem}_*" for stem in stars_stems]
+        else:
+            patterns = [f"ECOv003_{prod}_{stem}_*" for stem in overpass_stems]
+        for batch in _batched(patterns, pattern_batch_size):
+            tasks.append((prod, list(batch)))
+
+    if verbose:
+        logger.info(
+            f"Resolving GeoTIFF asset URLs for {len(granules_df):,} granules across "
+            f"{len(all_products)} products ({len(tasks)} pattern batches, workers={min(cmr_workers, max(1, len(tasks)))})..."
+        )
+
+    def _run_batch(task: Tuple[str, List[str]]) -> pd.DataFrame:
+        prod, patterns = task
+        # CloudCover in CMR is populated on L2T_LSTE (null on L3T_JET/L3T_ETAUX/L2T_STARS)
+        cc_filter = max_cloud_cover if prod == "L2T_LSTE" else None
+        entries = search_granules_by_name_patterns(
+            concept_ID=CONCEPT_IDS[prod],
+            granule_patterns=patterns,
+            max_cloud_cover=cc_filter,
+            tif_only=True,
+            CMR_search_URL=CMR_search_URL,
+            session=session,
+        )
+        if not entries:
+            return pd.DataFrame()
+        return interpret_ECOSTRESS_URLs(
+            URLs=[e["URL"] for e in entries],
+            entry_metadata=entries,
+        )
+
+    frames: List[pd.DataFrame] = []
+    with logging_redirect_tqdm(), ThreadPoolExecutor(
+        max_workers=max(1, min(cmr_workers, max(1, len(tasks))))
+    ) as executor:
+        futures = [executor.submit(_run_batch, t) for t in tasks]
+        with tqdm(
+            total=len(tasks),
+            desc="Resolving asset URLs",
+            unit="batch",
+            dynamic_ncols=True,
+            disable=not verbose,
+        ) as pbar:
+            for future in as_completed(futures):
+                df_part = future.result()
+                if not df_part.empty:
+                    frames.append(df_part)
+                pbar.update(1)
+
+    if not frames:
+        return pd.DataFrame()
+
+    tifs = pd.concat(frames, ignore_index=True)
+    instantaneous_keys: Dict[str, Set[Tuple[int, int, str, str]]] = {
+        prod: set() for prod in all_products if prod != "L2T_STARS"
+    }
+    stars_keys: Set[Tuple[str, str]] = set()
+    overpass_urls: Dict[Tuple[int, int, str, str], Dict[str, str]] = {}
+    stars_urls: Dict[Tuple[str, str], Dict[str, str]] = {}
+
+    for _, row in tifs.iterrows():
+        granule = row["granule"]
+        variable = row["variable"]
+        url = row["URL"]
+        prod, orbit, scene, tile, ts = _extract_granule_join_keys(granule)
+        if prod == "L2T_STARS":
+            s_key = (tile, ts[:8])
+            stars_keys.add(s_key)
+            stars_urls.setdefault(s_key, {})[variable] = url
+        else:
+            key = (orbit, scene, tile, ts)
+            overpass_urls.setdefault(key, {})[variable] = url
+            if prod in instantaneous_keys:
+                instantaneous_keys[prod].add(key)
+
+    required_inst = [p for p in all_products if p != "L2T_STARS"]
+    resolved_rows: List[Dict[str, Any]] = []
+    for _, row in granules_df.iterrows():
+        key = (int(row["orbit"]), int(row["scene"]), str(row["tile"]), str(row["timestamp"]))
+        s_key = (str(row["tile"]), str(row["date_str"])[:8])
+        if s_key in stars_keys and all(key in instantaneous_keys[p] for p in required_inst):
+            merged_urls = dict(stars_urls.get(s_key, {}))
+            merged_urls.update(overpass_urls.get(key, {}))
+            rec = row.to_dict()
+            rec["variable_urls"] = merged_urls
+            resolved_rows.append(rec)
+
+    return pd.DataFrame(resolved_rows)
 
 
 def find_clear_sky_et_granules(
@@ -110,6 +175,7 @@ def find_clear_sky_et_granules(
     max_cloud_cover: Optional[float] = 20.0,
     extra_products: Optional[List[str]] = None,
     min_granules_floor: int = 1,
+    resolve_urls: bool = True,
     CMR_search_URL: str = CMR_SEARCH_URL,
     session: Optional[requests.Session] = None,
     regional_batch_threshold: int = 25,
@@ -119,14 +185,15 @@ def find_clear_sky_et_granules(
     verbose: bool = True,
 ) -> pd.DataFrame:
     """
-    Two-pass ET-first discovery for complete multi-product ECOSTRESS overpasses:
-      Pass 1: Sweep L3T_JET across compact (15 deg x 31-day) regional boxes to
-              identify daytime clear-sky scenes where an ET retrieval succeeded,
-              and prune tiles below min_granules_floor early.
-      Pass 2: Resolve companion products (L2T_LSTE, L3T_ETAUX, L2T_STARS, plus any
-              extra_products) strictly for the surviving L3T_JET overpasses and
-              (tile, YYYYMMDD) dates using exact wildcard readable_granule_name[]
-              batches—eliminating blind spatial sweeps for non-ET scenes.
+    Fast ET-first discovery for complete multi-product ECOSTRESS overpasses:
+      - For small tile subsets (<= regional_batch_threshold): queries CMR directly
+        per tile and resolves full GeoTIFF URLs.
+      - For large/global tile sets (> regional_batch_threshold): uses NASA CMR's
+        lightweight UMM-JSON endpoint (granules.umm_json) across global temporal
+        chunks to index L3T_JET and server-side cloud-filtered L2T_LSTE in seconds
+        with zero spatial-overlap duplicates, prunes tiles below min_granules_floor,
+        and resolves GeoTIFF URLs via wildcard readable_granule_name[] batches only
+        when resolve_urls=True.
     """
     companion_products = ["L2T_LSTE", "L3T_ETAUX", "L2T_STARS"]
     if extra_products:
@@ -150,282 +217,142 @@ def find_clear_sky_et_granules(
             session=session,
         )
         tifs = listing[listing["type"] == "GeoTIFF Data"].copy() if not listing.empty else pd.DataFrame()
-    else:
-        if cmr_cache_dir:
-            os.makedirs(cmr_cache_dir, exist_ok=True)
-
-        # --- Pass 1: Discover L3T_JET overpasses across compact (15 deg x 31-day) buckets ---
-        regions = _cluster_tiles_to_regional_boxes(unique_tiles, deg_step=15.0)
-        temporal_chunks = _iter_temporal_chunks(start_date, end_date, chunk_days=31)
-        jet_tasks = [
-            (bbox, region_tiles, c_start, c_end)
-            for bbox, region_tiles in regions
-            for c_start, c_end in temporal_chunks
-        ]
-
-        if verbose:
-            logger.info(
-                f"Pass 1/2 [L3T_JET]: querying {len(regions)} boxes x {len(temporal_chunks)} monthly chunks "
-                f"({len(jet_tasks)} requests, workers={min(cmr_workers, len(jet_tasks))})..."
-            )
-
-        def _query_jet_chunk(task):
-            bbox, region_tiles, c_start, c_end = task
-            task_file = (
-                _cmr_task_cache_path(
-                    cmr_cache_dir,
-                    f"pass1_L3T_JET_{c_start}_{c_end}",
-                    f"{bbox}|{c_start}|{c_end}|{max_cloud_cover}|{','.join(sorted(region_tiles))}",
-                )
-                if cmr_cache_dir
-                else None
-            )
-            if task_file and os.path.exists(task_file):
-                try:
-                    return pd.read_parquet(task_file), True
-                except Exception:
-                    pass
-
-            entries = ECOSTRESS_CMR_search_entries(
-                concept_ID=CONCEPT_IDS["L3T_JET"],
-                bounding_box=bbox,
-                start_date=c_start,
-                end_date=c_end,
-                max_cloud_cover=max_cloud_cover,
-                allowed_tiles=region_tiles,
-                tif_only=True,
-                CMR_search_URL=CMR_search_URL,
-                session=session,
-            )
-            df_chunk = (
-                interpret_ECOSTRESS_URLs(
-                    URLs=[e["URL"] for e in entries],
-                    entry_metadata=entries,
-                )
-                if entries
-                else pd.DataFrame()
-            )
-            if task_file:
-                tmp_file = f"{task_file}.tmp.{os.getpid()}"
-                df_chunk.to_parquet(tmp_file, index=False)
-                os.replace(tmp_file, task_file)
-            return df_chunk, False
-
-        jet_frames: List[pd.DataFrame] = []
-        jet_assets = 0
-        cached_hits = 0
-        milestone_step = max(1, len(jet_tasks) // 10)
-
-        with logging_redirect_tqdm(), ThreadPoolExecutor(
-            max_workers=max(1, min(cmr_workers, len(jet_tasks)))
-        ) as executor:
-            futures = [executor.submit(_query_jet_chunk, t) for t in jet_tasks]
-            with tqdm(
-                total=len(jet_tasks),
-                desc="Pass 1/2 (L3T_JET)",
-                unit="req",
-                dynamic_ncols=True,
-                disable=not verbose,
-            ) as pbar:
-                for completed_idx, future in enumerate(as_completed(futures), start=1):
-                    df_chunk, from_cache = future.result()
-                    if from_cache:
-                        cached_hits += 1
-                    if not df_chunk.empty:
-                        jet_frames.append(df_chunk)
-                        jet_assets += len(df_chunk)
-                    pbar.set_postfix(
-                        jet_tifs=f"{jet_assets:,}",
-                        cached=cached_hits,
-                        refresh=False,
-                    )
-                    pbar.update(1)
-                    if verbose and (completed_idx % milestone_step == 0 or completed_idx == len(jet_tasks)):
-                        logger.info(
-                            f"  Pass 1/2 [L3T_JET] progress: {completed_idx}/{len(jet_tasks)} requests "
-                            f"({100.0 * completed_idx / len(jet_tasks):.0f}%), {jet_assets:,} GeoTIFF assets"
-                        )
-
-        jet_df = pd.concat(jet_frames, ignore_index=True) if jet_frames else pd.DataFrame()
-        if jet_df.empty:
-            if cmr_cache_dir and os.path.isdir(cmr_cache_dir):
-                shutil.rmtree(cmr_cache_dir, ignore_errors=True)
+        if tifs.empty:
             return pd.DataFrame()
 
-        # Prune tiles with fewer than min_granules_floor L3T_JET overpasses before Pass 2
-        jet_unique = jet_df.drop_duplicates(subset=["granule"])
-        tile_jet_counts = jet_unique.groupby("tile").size()
-        eligible_tiles = set(tile_jet_counts[tile_jet_counts >= max(1, min_granules_floor)].index.tolist())
-        if not eligible_tiles:
-            if cmr_cache_dir and os.path.isdir(cmr_cache_dir):
-                shutil.rmtree(cmr_cache_dir, ignore_errors=True)
-            return pd.DataFrame()
+        instantaneous_keys: Dict[str, set] = {
+            prod: set() for prod in required_products if prod != "L2T_STARS"
+        }
+        stars_keys: set = set()
+        jet_granule_meta: Dict[Tuple[int, int, str, str], Dict[str, Any]] = {}
+        overpass_urls: Dict[Tuple[int, int, str, str], Dict[str, str]] = {}
+        stars_urls: Dict[Tuple[str, str], Dict[str, str]] = {}
 
-        jet_df = jet_df[jet_df["tile"].isin(eligible_tiles)].copy()
-        jet_unique = jet_unique[jet_unique["tile"].isin(eligible_tiles)].copy()
-
-        overpass_stems = sorted(
-            {
-                f"{int(r.orbit):05d}_{int(r.scene):03d}_{r.tile}_{r.granule.split('_')[6]}"
-                for r in jet_unique.itertuples()
-            }
-        )
-        stars_stems = sorted(
-            {
-                f"{r.tile}_{r.granule.split('_')[6][:8]}"
-                for r in jet_unique.itertuples()
-            }
-        )
-
-        # --- Pass 2: Targeted companion lookup via wildcard readable_granule_name[] batches ---
-        companion_tasks: List[Tuple[str, List[str]]] = []
-        for prod in companion_products:
+        for _, row in tifs.iterrows():
+            granule = row["granule"]
+            variable = row["variable"]
+            url = row["URL"]
+            prod, orbit, scene, tile, ts = _extract_granule_join_keys(granule)
             if prod == "L2T_STARS":
-                patterns = [f"ECOv003_L2T_STARS_{stem}_*" for stem in stars_stems]
+                s_key = (tile, ts[:8])
+                stars_keys.add(s_key)
+                stars_urls.setdefault(s_key, {})[variable] = url
             else:
-                patterns = [f"ECOv003_{prod}_{stem}_*" for stem in overpass_stems]
-            for batch in _batched(patterns, pattern_batch_size):
-                companion_tasks.append((prod, list(batch)))
+                key = (orbit, scene, tile, ts)
+                overpass_urls.setdefault(key, {})[variable] = url
+                if prod in instantaneous_keys:
+                    instantaneous_keys[prod].add(key)
+                if prod == "L3T_JET" and key not in jet_granule_meta:
+                    jet_granule_meta[key] = {
+                        "granule": granule,
+                        "orbit": orbit,
+                        "scene": scene,
+                        "tile": tile,
+                        "timestamp": ts,
+                        "date_str": ts[:8],
+                        "cloud_cover": row.get("cloud_cover"),
+                    }
 
-        if verbose:
-            logger.info(
-                f"Pass 2/2 [Companions]: resolving {len(overpass_stems):,} L3T_JET overpasses & "
-                f"{len(stars_stems):,} tile-dates across {len(eligible_tiles):,} eligible tiles "
-                f"({len(companion_tasks)} batch requests, workers={min(cmr_workers, max(1, len(companion_tasks)))})..."
-            )
+        complete_rows = []
+        required_inst_products = [p for p in required_products if p not in ("L3T_JET", "L2T_STARS")]
+        for key, meta in jet_granule_meta.items():
+            _, _, tile, ts = key
+            date_str = ts[:8]
+            s_key = (tile, date_str)
+            if s_key in stars_keys and all(key in instantaneous_keys[p] for p in required_inst_products):
+                month = int(date_str[4:6])
+                meta["quarter"] = (month - 1) // 3 + 1
+                merged_urls = dict(stars_urls.get(s_key, {}))
+                merged_urls.update(overpass_urls.get(key, {}))
+                meta["variable_urls"] = merged_urls
+                complete_rows.append(meta)
 
-        def _query_companion_batch(task):
-            prod, patterns = task
-            task_file = (
-                _cmr_task_cache_path(
-                    cmr_cache_dir,
-                    f"pass2_{prod}",
-                    f"{prod}|{max_cloud_cover}|{','.join(patterns)}",
-                )
-                if cmr_cache_dir
-                else None
-            )
-            if task_file and os.path.exists(task_file):
-                try:
-                    return pd.read_parquet(task_file), True
-                except Exception:
-                    pass
+        return pd.DataFrame(complete_rows)
 
-            entries = search_granules_by_name_patterns(
-                concept_ID=CONCEPT_IDS[prod],
-                granule_patterns=patterns,
-                max_cloud_cover=max_cloud_cover,
-                tif_only=True,
-                CMR_search_URL=CMR_search_URL,
-                session=session,
-            )
-            df_chunk = (
-                interpret_ECOSTRESS_URLs(
-                    URLs=[e["URL"] for e in entries],
-                    entry_metadata=entries,
-                )
-                if entries
-                else pd.DataFrame()
-            )
-            if task_file:
-                tmp_file = f"{task_file}.tmp.{os.getpid()}"
-                df_chunk.to_parquet(tmp_file, index=False)
-                os.replace(tmp_file, task_file)
-            return df_chunk, False
-
-        comp_frames: List[pd.DataFrame] = [jet_df]
-        comp_assets = 0
-        comp_cached = 0
-        comp_milestone = max(1, len(companion_tasks) // 10)
-
-        with logging_redirect_tqdm(), ThreadPoolExecutor(
-            max_workers=max(1, min(cmr_workers, max(1, len(companion_tasks))))
-        ) as executor:
-            futures = [executor.submit(_query_companion_batch, t) for t in companion_tasks]
-            with tqdm(
-                total=len(companion_tasks),
-                desc="Pass 2/2 (Companions)",
-                unit="batch",
-                dynamic_ncols=True,
-                disable=not verbose,
-            ) as pbar:
-                for completed_idx, future in enumerate(as_completed(futures), start=1):
-                    df_chunk, from_cache = future.result()
-                    if from_cache:
-                        comp_cached += 1
-                    if not df_chunk.empty:
-                        comp_frames.append(df_chunk)
-                        comp_assets += len(df_chunk)
-                    pbar.set_postfix(
-                        comp_tifs=f"{comp_assets:,}",
-                        cached=comp_cached,
-                        refresh=False,
-                    )
-                    pbar.update(1)
-                    if verbose and (
-                        completed_idx % comp_milestone == 0 or completed_idx == len(companion_tasks)
-                    ):
-                        logger.info(
-                            f"  Pass 2/2 [Companions] progress: {completed_idx}/{len(companion_tasks)} batches "
-                            f"({100.0 * completed_idx / len(companion_tasks):.0f}%), {comp_assets:,} companion GeoTIFFs"
-                        )
-
-        tifs = pd.concat(comp_frames, ignore_index=True)
-
-    if tifs.empty:
+    # --- Large / Global UMM-JSON Fast Path ---
+    allowed_tile_set = set(unique_tiles)
+    if verbose:
+        logger.info(
+            f"UMM-JSON Pass 1/2 [L3T_JET]: indexing global ET granules across "
+            f"{len(allowed_tile_set):,} target tiles ({start_date} to {end_date})..."
+        )
+    jet_df = search_granule_catalog_umm(
+        concept_ID=CONCEPT_IDS["L3T_JET"],
+        start_date=start_date,
+        end_date=end_date,
+        max_cloud_cover=None,  # CloudCover is null on L3T_JET in CMR; filtered via L2T_LSTE below
+        allowed_tiles=allowed_tile_set,
+        chunk_days=31,
+        max_workers=cmr_workers,
+        CMR_search_URL=CMR_search_URL,
+        session=session,
+        desc="UMM Pass 1/2 (L3T_JET)",
+        verbose=verbose,
+    )
+    if jet_df.empty:
         return pd.DataFrame()
 
-    instantaneous_keys: Dict[str, set] = {
-        prod: set() for prod in required_products if prod != "L2T_STARS"
-    }
-    stars_keys: set = set()
-    jet_granule_meta: Dict[Tuple[int, int, str, str], Dict[str, Any]] = {}
-    overpass_urls: Dict[Tuple[int, int, str, str], Dict[str, str]] = {}
-    stars_urls: Dict[Tuple[str, str], Dict[str, str]] = {}
+    # Prune tiles below min_granules_floor before querying L2T_LSTE
+    jet_counts = jet_df.groupby("tile").size()
+    eligible_tiles = set(jet_counts[jet_counts >= max(1, min_granules_floor)].index.tolist())
+    if not eligible_tiles:
+        return pd.DataFrame()
+    jet_df = jet_df[jet_df["tile"].isin(eligible_tiles)].copy()
 
-    for _, row in tifs.iterrows():
-        granule = row["granule"]
-        variable = row["variable"]
-        url = row["URL"]
-        prod, orbit, scene, tile, ts = _extract_granule_join_keys(granule)
-        if prod == "L2T_STARS":
-            s_key = (tile, ts[:8])
-            stars_keys.add(s_key)
-            stars_urls.setdefault(s_key, {})[variable] = url
-        else:
-            key = (orbit, scene, tile, ts)
-            overpass_urls.setdefault(key, {})[variable] = url
-            if prod in instantaneous_keys:
-                instantaneous_keys[prod].add(key)
-            if prod == "L3T_JET" and key not in jet_granule_meta:
-                jet_granule_meta[key] = {
-                    "granule": granule,
-                    "orbit": orbit,
-                    "scene": scene,
-                    "tile": tile,
-                    "timestamp": ts,
-                    "date_str": ts[:8],
-                    "cloud_cover": row.get("cloud_cover"),
-                }
+    if verbose:
+        logger.info(
+            f"UMM-JSON Pass 2/2 [L2T_LSTE]: indexing clear-sky LSTE granules "
+            f"(max_cloud_cover={max_cloud_cover}) across {len(eligible_tiles):,} eligible tiles..."
+        )
+    lste_df = search_granule_catalog_umm(
+        concept_ID=CONCEPT_IDS["L2T_LSTE"],
+        start_date=start_date,
+        end_date=end_date,
+        max_cloud_cover=max_cloud_cover,
+        allowed_tiles=eligible_tiles,
+        chunk_days=31,
+        max_workers=cmr_workers,
+        CMR_search_URL=CMR_search_URL,
+        session=session,
+        desc="UMM Pass 2/2 (L2T_LSTE)",
+        verbose=verbose,
+    )
+    if lste_df.empty:
+        return pd.DataFrame()
 
-    complete_rows = []
-    required_inst_products = [p for p in required_products if p not in ("L3T_JET", "L2T_STARS")]
-    for key, meta in jet_granule_meta.items():
-        _, _, tile, ts = key
-        date_str = ts[:8]
-        s_key = (tile, date_str)
-        if s_key in stars_keys and all(key in instantaneous_keys[p] for p in required_inst_products):
-            month = int(date_str[4:6])
-            meta["quarter"] = (month - 1) // 3 + 1
-            merged_urls = dict(stars_urls.get(s_key, {}))
-            merged_urls.update(overpass_urls.get(key, {}))
-            meta["variable_urls"] = merged_urls
-            complete_rows.append(meta)
+    lste_keys = lste_df[["orbit", "scene", "tile", "timestamp", "cloud_cover"]].drop_duplicates(
+        subset=["orbit", "scene", "tile", "timestamp"]
+    )
+    joined = jet_df.drop(columns=["cloud_cover"]).merge(
+        lste_keys,
+        on=["orbit", "scene", "tile", "timestamp"],
+        how="inner",
+    )
+    if joined.empty:
+        return pd.DataFrame()
 
-    result_df = pd.DataFrame(complete_rows)
-    if cmr_cache_dir and os.path.isdir(cmr_cache_dir):
-        shutil.rmtree(cmr_cache_dir, ignore_errors=True)
-    return result_df
+    post_counts = joined.groupby("tile").size()
+    final_tiles = set(post_counts[post_counts >= max(1, min_granules_floor)].index.tolist())
+    if not final_tiles:
+        return pd.DataFrame()
+
+    joined = joined[joined["tile"].isin(final_tiles)].copy()
+    joined["quarter"] = joined["date_str"].str[4:6].astype(int).sub(1).floordiv(3).add(1)
+    joined = joined.sort_values(["tile", "timestamp"], kind="mergesort").reset_index(drop=True)
+
+    if not resolve_urls:
+        return joined
+
+    return resolve_granule_asset_urls(
+        granules_df=joined,
+        extra_products=extra_products,
+        max_cloud_cover=max_cloud_cover,
+        CMR_search_URL=CMR_search_URL,
+        session=session,
+        cmr_workers=cmr_workers,
+        pattern_batch_size=pattern_batch_size,
+        verbose=verbose,
+    )
 
 
 def select_stratified_granules(

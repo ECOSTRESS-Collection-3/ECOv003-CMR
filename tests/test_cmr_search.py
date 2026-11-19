@@ -2,7 +2,10 @@ import importlib
 
 import pytest
 
-from ECOv003_CMR.ECOSTRESS_CMR_search_links import ECOSTRESS_CMR_search_links
+from ECOv003_CMR.ECOSTRESS_CMR_search_links import (
+    ECOSTRESS_CMR_search_links,
+    search_granule_catalog_umm,
+)
 from ECOv003_CMR.granule_ID_from_filename import granule_ID_from_filename
 from ECOv003_CMR.interpret_ECOSTRESS_URLs import interpret_ECOSTRESS_URLs
 from ECOv003_CMR.product_name_from_filename import product_name_from_filename
@@ -10,8 +13,11 @@ from ECOv003_CMR.variable_from_filename import variable_from_filename
 
 
 class MockCMRResponse:
-    def __init__(self, entries, headers=None):
-        self.payload = {"feed": {"entry": entries}}
+    def __init__(self, entries=None, headers=None, items=None):
+        if items is not None:
+            self.payload = {"items": items}
+        else:
+            self.payload = {"feed": {"entry": entries or []}}
         self.headers = headers or {}
 
     def raise_for_status(self):
@@ -19,6 +25,65 @@ class MockCMRResponse:
 
     def json(self):
         return self.payload
+
+
+def test_search_granule_catalog_umm_paginates_and_filters_tiles(monkeypatch):
+    search_after = '["provider", 999]'
+    responses = [
+        MockCMRResponse(
+            items=[
+                {
+                    "umm": {
+                        "GranuleUR": "ECOv003_L2T_LSTE_44814_001_11SLT_20260601T000306_02",
+                        "TemporalExtent": {"RangeDateTime": {"BeginningDateTime": "2026-06-01T00:03:06Z"}},
+                        "CloudExtent": {"CloudCover": 12.5},
+                    }
+                },
+                {
+                    "umm": {
+                        "GranuleUR": "ECOv003_L2T_LSTE_44814_001_52NHN_20260601T000306_02",
+                        "TemporalExtent": {"RangeDateTime": {"BeginningDateTime": "2026-06-01T00:03:06Z"}},
+                        "CloudExtent": {"CloudCover": 5.0},
+                    }
+                },
+            ],
+            headers={"CMR-Search-After": search_after},
+        ),
+        MockCMRResponse(
+            items=[
+                {
+                    "umm": {
+                        "GranuleUR": "ECOv003_L2T_LSTE_44860_002_11SLT_20260602T120000_02",
+                        "TemporalExtent": {"RangeDateTime": {"BeginningDateTime": "2026-06-02T12:00:00Z"}},
+                        "CloudExtent": {"CloudCover": 8.0},
+                    }
+                }
+            ]
+        ),
+    ]
+    calls = []
+
+    def mock_get(url, params, headers):
+        calls.append({"url": url, "params": params, "headers": headers})
+        return responses.pop(0)
+
+    mod = importlib.import_module("ECOv003_CMR.ECOSTRESS_CMR_search_links")
+    monkeypatch.setattr(mod.requests, "get", mock_get)
+
+    df = search_granule_catalog_umm(
+        concept_ID="C3998139651-LPCLOUD",
+        start_date="2026-06-01",
+        end_date="2026-06-02",
+        max_cloud_cover=20.0,
+        allowed_tiles={"11SLT"},
+        chunk_days=None,
+    )
+
+    assert len(df) == 2
+    assert set(df["tile"]) == {"11SLT"}
+    assert df["cloud_cover"].tolist() == [12.5, 8.0]
+    assert calls[0]["url"].endswith("granules.umm_json")
+    assert calls[0]["params"]["cloud_cover"] == "0,20.0"
 
 
 def test_search_links_follows_search_after_pages(monkeypatch):

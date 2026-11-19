@@ -29,6 +29,7 @@ from .stratified_sampling import (
     compute_per_granule_quota,
     extract_valid_swath_mask,
     find_clear_sky_et_granules,
+    resolve_granule_asset_urls,
     sample_granule_coordinates,
     select_stratified_granules,
 )
@@ -173,9 +174,9 @@ def build_stratified_dataset(
 ) -> Dict[str, Any]:
     """
     Build a spatially and seasonally stratified ECOSTRESS Collection 3 point-sample
-    dataset with persistent catalog caching, bounded HTTP stream concurrency,
-    synchronous URS cookie refresh across batches, adaptive quota refills, live
-    tqdm progress bars, and streaming O(1)-memory Parquet diagnostics.
+    dataset with UMM-JSON catalog discovery, lazy post-stratification asset URL
+    resolution, bounded HTTP stream concurrency, synchronous URS cookie refresh
+    across batches, adaptive quota refills, and O(1)-memory Parquet diagnostics.
     """
     t_start = time.perf_counter()
     timings: Dict[str, float] = {}
@@ -221,7 +222,7 @@ def build_stratified_dataset(
         required_products=required_products,
     )
     if candidate_granules is not None:
-        _log(f"[3/6] Loaded {len(candidate_granules)} cached candidate overpasses from {catalog_path}")
+        _log(f"[3/6] Loaded {len(candidate_granules):,} cached candidate overpasses from {catalog_path}")
     else:
         _log(
             f"[3/6] Querying CMR for complete clear-sky ET overpasses "
@@ -234,9 +235,9 @@ def build_stratified_dataset(
             max_cloud_cover=max_cloud_cover,
             extra_products=extra_products,
             min_granules_floor=min_granules_floor,
+            resolve_urls=False,
             session=session,
-            cmr_workers=max(1, min(6, max_workers)),
-            cmr_cache_dir=os.path.join(output_dir, "cmr_task_cache"),
+            cmr_workers=max(1, min(8, max_workers)),
             verbose=verbose,
         )
         if not candidate_granules.empty:
@@ -251,7 +252,7 @@ def build_stratified_dataset(
     tile_preview = dict(list(tile_counts.items())[:10])
     suffix = f" ... (+{len(tile_counts) - 10} more tiles)" if len(tile_counts) > 10 else ""
     _log(
-        f"[3/6] Found {len(candidate_granules):,} complete candidate overpasses across "
+        f"[3/6] Found {len(candidate_granules):,} candidate overpasses across "
         f"{len(tile_counts):,} tiles: {tile_preview}{suffix} ({timings['cmr_search_s']:.2f}s)"
     )
 
@@ -264,6 +265,58 @@ def build_stratified_dataset(
     )
     if selected_granules.empty:
         _log(f"[4/6] No tiles met min_granules_floor={min_granules_floor}.")
+        return {"total_samples": 0, "selected_granules": 0, "n_cap": 0, "timings": timings}
+
+    # Resolve GeoTIFF asset URLs lazily only for selected granules (if not already resolved)
+    if "variable_urls" not in selected_granules.columns or not selected_granules["variable_urls"].apply(
+        lambda d: isinstance(d, dict) and len(d) > 0
+    ).all():
+        resolved_selected = resolve_granule_asset_urls(
+            granules_df=selected_granules,
+            extra_products=extra_products,
+            max_cloud_cover=max_cloud_cover,
+            session=session,
+            cmr_workers=max(1, min(8, max_workers)),
+            verbose=verbose,
+        )
+        # Backfill any tile that lost a granule due to a missing companion product
+        if len(resolved_selected) < len(selected_granules):
+            selected_set = set(selected_granules["granule"])
+            remaining_candidates = candidate_granules[
+                ~candidate_granules["granule"].isin(selected_set)
+            ]
+            resolved_counts = resolved_selected.groupby("tile").size().to_dict() if not resolved_selected.empty else {}
+            deficits = {
+                t: n_cap - resolved_counts.get(t, 0)
+                for t in selected_granules["tile"].unique()
+                if resolved_counts.get(t, 0) < n_cap
+            }
+            if deficits and not remaining_candidates.empty:
+                backfill_rows = []
+                for t, need in deficits.items():
+                    t_pool = remaining_candidates[remaining_candidates["tile"] == t].head(need * 2)
+                    if not t_pool.empty:
+                        backfill_rows.append(t_pool)
+                if backfill_rows:
+                    backfill_resolved = resolve_granule_asset_urls(
+                        granules_df=pd.concat(backfill_rows, ignore_index=True),
+                        extra_products=extra_products,
+                        max_cloud_cover=max_cloud_cover,
+                        session=session,
+                        cmr_workers=max(1, min(8, max_workers)),
+                        verbose=False,
+                    )
+                    if not backfill_resolved.empty:
+                        combined = pd.concat([resolved_selected, backfill_resolved], ignore_index=True)
+                        resolved_selected = (
+                            combined.groupby("tile", group_keys=False)
+                            .head(n_cap)
+                            .reset_index(drop=True)
+                        )
+        selected_granules = resolved_selected
+
+    if selected_granules.empty:
+        _log("[4/6] No complete multi-product granules remained after companion URL resolution.")
         return {"total_samples": 0, "selected_granules": 0, "n_cap": 0, "timings": timings}
 
     quota_k, candidate_n = compute_per_granule_quota(

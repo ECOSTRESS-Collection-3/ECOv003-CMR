@@ -83,50 +83,110 @@ def test_sample_granule_coordinates_dispersion_and_cropland_balance():
     assert crop_count == 10
 
 
-def test_find_clear_sky_et_granules_uses_jet_first_two_pass_discovery(monkeypatch):
+def test_find_clear_sky_et_granules_uses_umm_join_and_lazy_pattern_resolution(monkeypatch):
     strat_mod = importlib.import_module("ECOv003_CMR.stratified_sampling")
-    jet_calls = []
-    companion_calls = []
+    umm_calls = []
+    pattern_calls = []
 
-    def mock_entries(**kwargs):
-        jet_calls.append(kwargs)
-        assert kwargs["concept_ID"] == "C4057232489-LPCLOUD"
-        if "11SLT" in kwargs.get("allowed_tiles", set()):
-            gid = "ECOv003_L3T_JET_44814_001_11SLT_20260601T000306_01"
-            return [{"URL": f"https://example.test/{gid}_PTJPLSMinst.tif", "cloud_cover": 5.0}]
-        return []
+    def mock_umm(**kwargs):
+        umm_calls.append(kwargs)
+        cid = kwargs["concept_ID"]
+        if cid == "C4057232489-LPCLOUD":  # L3T_JET
+            assert kwargs["max_cloud_cover"] is None
+            return pd.DataFrame(
+                [
+                    {
+                        "granule": "ECOv003_L3T_JET_44814_001_11SLT_20260601T000306_01",
+                        "product": "L3T_JET",
+                        "orbit": 44814,
+                        "scene": 1,
+                        "tile": "11SLT",
+                        "timestamp": "20260601T000306",
+                        "date_str": "20260601",
+                        "time_start": "2026-06-01T00:03:06Z",
+                        "cloud_cover": None,
+                    },
+                    {
+                        "granule": "ECOv003_L3T_JET_44900_002_52NHN_20260605T120000_01",
+                        "product": "L3T_JET",
+                        "orbit": 44900,
+                        "scene": 2,
+                        "tile": "52NHN",
+                        "timestamp": "20260605T120000",
+                        "date_str": "20260605",
+                        "time_start": "2026-06-05T12:00:00Z",
+                        "cloud_cover": None,
+                    },
+                ]
+            )
+        if cid == "C3998139651-LPCLOUD":  # L2T_LSTE (only 11SLT passes cloud_cover <= 20)
+            assert kwargs["max_cloud_cover"] == 20.0
+            return pd.DataFrame(
+                [
+                    {
+                        "granule": "ECOv003_L2T_LSTE_44814_001_11SLT_20260601T000306_02",
+                        "product": "L2T_LSTE",
+                        "orbit": 44814,
+                        "scene": 1,
+                        "tile": "11SLT",
+                        "timestamp": "20260601T000306",
+                        "date_str": "20260601",
+                        "time_start": "2026-06-01T00:03:06Z",
+                        "cloud_cover": 7.5,
+                    }
+                ]
+            )
+        return pd.DataFrame()
 
     def mock_patterns(**kwargs):
-        companion_calls.append(kwargs)
+        pattern_calls.append(kwargs)
         cid = kwargs["concept_ID"]
         prod_map = {
+            "C4057232489-LPCLOUD": ("L3T_JET", "PTJPLSMinst"),
             "C3998139651-LPCLOUD": ("L2T_LSTE", "LST"),
             "C4057520953-LPCLOUD": ("L3T_ETAUX", "Ta"),
             "C3998139658-LPCLOUD": ("L2T_STARS", "NDVI"),
         }
         prod, var = prod_map[cid]
         if prod == "L2T_STARS":
-            assert kwargs["granule_patterns"] == ["ECOv003_L2T_STARS_11SLT_20260601_*"]
             gid = "ECOv003_L2T_STARS_11SLT_20260601_01"
         else:
-            assert kwargs["granule_patterns"] == [f"ECOv003_{prod}_44814_001_11SLT_20260601T000306_*"]
             gid = f"ECOv003_{prod}_44814_001_11SLT_20260601T000306_01"
-        return [{"URL": f"https://example.test/{gid}_{var}.tif", "cloud_cover": 5.0}]
+        return [{"URL": f"https://example.test/{gid}_{var}.tif", "cloud_cover": 7.5}]
 
-    monkeypatch.setattr(strat_mod, "ECOSTRESS_CMR_search_entries", mock_entries)
+    monkeypatch.setattr(strat_mod, "search_granule_catalog_umm", mock_umm)
     monkeypatch.setattr(strat_mod, "search_granules_by_name_patterns", mock_patterns)
+
     tiles = ["11SLT", "11SPS", "52NHN"]
-    df = find_clear_sky_et_granules(
+    # When resolve_urls=False, returns lightweight joined catalog with 0 pattern calls
+    catalog_only = find_clear_sky_et_granules(
         tiles=tiles,
         start_date="2026-06-01",
-        end_date="2026-06-02",
+        end_date="2026-06-06",
+        max_cloud_cover=20.0,
+        resolve_urls=False,
         regional_batch_threshold=2,
         verbose=False,
     )
-    assert len(jet_calls) > 0
-    assert len(companion_calls) == 3
-    assert len(df) == 1
-    assert df.iloc[0]["tile"] == "11SLT"
+    assert len(umm_calls) == 2
+    assert len(pattern_calls) == 0
+    assert len(catalog_only) == 1
+    assert catalog_only.iloc[0]["tile"] == "11SLT"
+    assert catalog_only.iloc[0]["cloud_cover"] == 7.5
+
+    # When resolve_urls=True, resolves all 4 products via pattern batches
+    full_df = find_clear_sky_et_granules(
+        tiles=tiles,
+        start_date="2026-06-01",
+        end_date="2026-06-06",
+        max_cloud_cover=20.0,
+        resolve_urls=True,
+        regional_batch_threshold=2,
+        verbose=False,
+    )
+    assert len(pattern_calls) == 4
+    assert len(full_df) == 1
+    assert set(full_df.iloc[0]["variable_urls"].keys()) == {"PTJPLSMinst", "LST", "Ta", "NDVI"}
 
 
 def test_build_stratified_dataset_catalog_cache_and_quota_refill(monkeypatch, tmp_path):
