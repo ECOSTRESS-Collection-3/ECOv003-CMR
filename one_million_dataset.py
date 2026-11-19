@@ -4,20 +4,14 @@ First-pass global 1,000,000-observation stratified ECOSTRESS Collection 3 datase
 generator.
 
 Usage:
-    # Full global 1M-sample run across a multi-month window (resumable via checkpoint manifest)
+    # Full global 1M-sample run across the 1-year window (resumable via checkpoint manifest)
+    python one_million_dataset.py
+
+    # Custom window or output subdirectory
     python one_million_dataset.py \
         --start-date 2026-06-01 \
         --end-date 2026-09-30 \
-        --output-dir ./uq_dataset_1m
-
-    # Fast pilot run on a subset of tiles before launching the global pass
-    python one_million_dataset.py \
-        --start-date 2026-06-01 \
-        --end-date 2026-06-30 \
-        --tiles 11SLT 11SPS 52NHN 53NMH \
-        --target-samples 10000 \
-        --min-granules-floor 2 \
-        --output-dir ./uq_dataset_pilot
+        --output-dir ./experimental_data/uq_dataset_1m
 """
 
 import argparse
@@ -64,14 +58,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./one_million_dataset",
-        help="Directory for partitioned Parquet outputs, checkpoint manifest, and catalog cache (default: ./uq_dataset_1m).",
+        default="./experimental_data/one_million_dataset",
+        help="Directory for partitioned Parquet outputs, checkpoint manifest, and catalog cache (default: ./experimental_data/one_million_dataset).",
     )
     parser.add_argument(
         "--start-date",
         type=str,
         default="2025-10-31",
-        help="Acquisition window start date in YYYY-MM-DD format (default: 2026-06-01).",
+        help="Acquisition window start date in YYYY-MM-DD format (default: 2025-10-31).",
     )
     parser.add_argument(
         "--end-date",

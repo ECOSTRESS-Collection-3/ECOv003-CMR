@@ -13,8 +13,8 @@ Usage:
         --start-date 2025-10-31 \
         --end-date 2026-10-31 \
         --min-granules-floor 4 \
-        --catalog-path ./one_million_dataset/candidate_granules.parquet \
-        --output-dir ./one_hundred_global_dataset
+        --catalog-path ./experimental_data/one_million_dataset/candidate_granules.parquet \
+        --output-dir ./experimental_data/one_hundred_global_dataset
 """
 
 import argparse
@@ -63,8 +63,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./one_hundred_dataset",
-        help="Directory for partitioned Parquet outputs, checkpoint manifest, and catalog cache (default: ./one_hundred_dataset).",
+        default="./experimental_data/one_hundred_dataset",
+        help="Directory for partitioned Parquet outputs, checkpoint manifest, and catalog cache (default: ./experimental_data/one_hundred_dataset).",
     )
     parser.add_argument(
         "--start-date",
