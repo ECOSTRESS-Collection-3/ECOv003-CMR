@@ -23,13 +23,15 @@ class MockCMRResponse:
 
 def test_search_links_follows_search_after_pages(monkeypatch):
     search_after = '["provider", 123, 456]'
+    url1 = "https://example.test/ECOv003_L2T_LSTE_44814_001_11SLT_20260601T000306_02_LST.tif"
+    url2 = "https://example.test/ECOv003_L2T_LSTE_44860_002_11SLT_20260602T120000_02_LST.tif"
     responses = [
         MockCMRResponse(
-            [{"links": [{"href": "https://example.test/granule-1.tif"}]}],
+            [{"links": [{"href": url1}]}],
             {"CMR-Search-After": search_after},
         ),
         MockCMRResponse(
-            [{"links": [{"href": "https://example.test/granule-2.tif"}]}]
+            [{"links": [{"href": url2}]}]
         ),
     ]
     calls = []
@@ -47,13 +49,10 @@ def test_search_links_follows_search_after_pages(monkeypatch):
         concept_ID="C3998139651-LPCLOUD",
         tile="11SLT",
         start_date="2026-06-01",
-        end_date="2026-06-01",
+        end_date="2026-06-02",
     )
 
-    assert urls == [
-        "https://example.test/granule-1.tif",
-        "https://example.test/granule-2.tif",
-    ]
+    assert urls == [url1, url2]
     assert calls[0]["headers"] == {}
     assert calls[1]["headers"] == {"CMR-Search-After": search_after}
     assert all(call["params"]["page_size"] == 2000 for call in calls)
@@ -61,8 +60,9 @@ def test_search_links_follows_search_after_pages(monkeypatch):
 
 def test_search_links_rejects_repeated_search_after_token(monkeypatch):
     search_after = '["provider", 123, 456]'
+    url1 = "https://example.test/ECOv003_L2T_LSTE_44814_001_11SLT_20260601T000306_02_LST.tif"
     response = MockCMRResponse(
-        [{"links": [{"href": "https://example.test/granule.tif"}]}],
+        [{"links": [{"href": url1}]}],
         {"CMR-Search-After": search_after},
     )
     search_links_module = importlib.import_module(
@@ -81,6 +81,54 @@ def test_search_links_rejects_repeated_search_after_token(monkeypatch):
             start_date="2026-06-01",
             end_date="2026-06-01",
         )
+
+
+def test_search_links_rejects_unparseable_urls_when_filtering_by_tile(monkeypatch):
+    valid_url = "https://example.test/ECOv003_L2T_LSTE_44814_001_11SLT_20260601T000306_02_LST.tif"
+    other_tile_url = "https://example.test/ECOv003_L2T_LSTE_44814_001_52NHN_20260601T000306_02_LST.tif"
+    malformed_url = "https://example.test/bad.tif"
+    response = MockCMRResponse(
+        [
+            {
+                "links": [
+                    {"href": valid_url},
+                    {"href": other_tile_url},
+                    {"href": malformed_url},
+                ]
+            }
+        ]
+    )
+    search_links_module = importlib.import_module(
+        "ECOv003_CMR.ECOSTRESS_CMR_search_links"
+    )
+    monkeypatch.setattr(search_links_module.requests, "get", lambda url, params, headers: response)
+
+    urls = ECOSTRESS_CMR_search_links(
+        concept_ID="C3998139651-LPCLOUD",
+        tile="11SLT",
+        start_date="2026-06-01",
+        end_date="2026-06-01",
+    )
+    assert urls == [valid_url]
+
+
+def test_cmr_search_propagates_session(monkeypatch):
+    search_module = importlib.import_module("ECOv003_CMR.ECOSTRESS_CMR_search")
+    seen_sessions = []
+
+    def mock_search_links(**kwargs):
+        seen_sessions.append(kwargs.get("session"))
+        return []
+
+    monkeypatch.setattr(search_module, "ECOSTRESS_CMR_search_links", mock_search_links)
+    sentinel_session = object()
+    search_module.ECOSTRESS_CMR_search(
+        product="L2T_LSTE",
+        tile="11SLT",
+        start_date="2026-06-01",
+        session=sentinel_session,
+    )
+    assert seen_sessions == [sentinel_session]
 
 
 def test_interpret_collection_3_filenames():

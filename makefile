@@ -1,7 +1,7 @@
 # Define the default Python version as a constant
 PYTHON_VERSION = 3.14
 
-.PHONY: dist clean test build twine-upload remove-environment install uninstall reinstall environment
+.PHONY: dist clean test test-sampler build twine-upload remove-environment install uninstall reinstall environment
 
 PACKAGE_NAME = ECOv003-CMR
 ENVIRONMENT_NAME = $(PACKAGE_NAME)
@@ -17,6 +17,11 @@ clean:
 
 test:
 	pytest tests
+
+test-sampler:
+	rm -rf ./stratified_dataset_test
+	python examples/stratified_sampling_demo.py
+	rm -rf ./stratified_dataset_test
 
 build:
 	python -m build

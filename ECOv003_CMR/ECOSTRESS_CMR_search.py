@@ -1,15 +1,14 @@
 import argparse
 import sys
-from typing import List, Union
+from typing import List, Optional, Union
 import logging
 import pandas as pd
+import requests
 from datetime import date
 from dateutil import parser
 
-from sentinel_tiles import sentinel_tiles
-
 from .constants import *
-from .ECOSTRESS_CMR_search_links import ECOSTRESS_CMR_search_links
+from .ECOSTRESS_CMR_search_links import ECOSTRESS_CMR_search_entries, ECOSTRESS_CMR_search_links
 from .interpret_ECOSTRESS_URLs import interpret_ECOSTRESS_URLs
 
 logger = logging.getLogger(__name__)
@@ -22,27 +21,13 @@ def ECOSTRESS_CMR_search(
         end_date: Union[date, str] = None,
         orbit: int = None,
         scene: int = None,
-        CMR_search_URL: str = CMR_SEARCH_URL) -> pd.DataFrame:
+        use_tile_bounds: bool = True,
+        max_cloud_cover: Optional[float] = None,
+        CMR_search_URL: str = CMR_SEARCH_URL,
+        session: Optional[requests.Session] = None) -> pd.DataFrame:
     """
     Search the CMR API for ECOSTRESS granules and return parsed results.
-
-    Args:
-        product: Collection 3 product code or list of product codes. Allowed values are:
-            L1CT_RAD, L2T_LSTE, L2T_STARS, L3T_ETAUX, L3T_JET, L4T_ESI, L4T_WUE.
-        tile: Sentinel-2 tile identifier or list of tile identifiers (for example, "11SLT").
-        start_date: Start date as a date object or parsable date string.
-        end_date: End date as a date object or parsable date string. Defaults to start_date.
-        orbit: Optional orbit number filter.
-        scene: Optional scene number filter.
-        CMR_search_URL: Base URL for CMR search.
-
-    Returns:
-        pandas.DataFrame with matched granule metadata.
-
-    Raises:
-        ValueError: If any product is invalid or no tile is provided.
     """
-    # Convert start_date and end_date to date objects if they are strings
     if isinstance(start_date, str):
         start_date = parser.parse(start_date).date()
 
@@ -51,19 +36,11 @@ def ECOSTRESS_CMR_search(
     elif isinstance(end_date, str):
         end_date = parser.parse(end_date).date()
 
-    if isinstance(product, str):
-        products = [product]
-    else:
-        products = list(product)
-
-    if isinstance(tile, str):
-        tiles = [tile]
-    else:
-        tiles = list(tile)
+    products = [product] if isinstance(product, str) else list(product)
+    tiles = [tile] if isinstance(tile, str) else list(tile)
 
     if len(products) == 0:
         raise ValueError("At least one product must be provided")
-
     if len(tiles) == 0:
         raise ValueError("At least one tile must be provided")
 
@@ -80,21 +57,34 @@ def ECOSTRESS_CMR_search(
     for item in products:
         concept_ID = CONCEPT_IDS[item]
         for item_tile in tiles:
-            # Get the URLs of ECOSTRESS granules using the helper function
-            URLs = ECOSTRESS_CMR_search_links(
-                concept_ID=concept_ID,
-                tile=item_tile,
-                start_date=start_date.strftime("%Y-%m-%d"),
-                end_date=end_date.strftime("%Y-%m-%d"),
-                CMR_search_URL=CMR_search_URL
-            )
-
+            if max_cloud_cover is None and use_tile_bounds:
+                URLs = ECOSTRESS_CMR_search_links(
+                    concept_ID=concept_ID,
+                    tile=item_tile,
+                    start_date=start_date.strftime("%Y-%m-%d"),
+                    end_date=end_date.strftime("%Y-%m-%d"),
+                    CMR_search_URL=CMR_search_URL,
+                    session=session,
+                )
+                entries = None
+            else:
+                entries = ECOSTRESS_CMR_search_entries(
+                    concept_ID=concept_ID,
+                    tile=item_tile,
+                    start_date=start_date.strftime("%Y-%m-%d"),
+                    end_date=end_date.strftime("%Y-%m-%d"),
+                    use_tile_bounds=use_tile_bounds,
+                    max_cloud_cover=max_cloud_cover,
+                    CMR_search_URL=CMR_search_URL,
+                    session=session,
+                )
+                URLs = [e["URL"] for e in entries]
             df = interpret_ECOSTRESS_URLs(
                 URLs=URLs,
                 orbit=orbit,
-                scene=scene
+                scene=scene,
+                entry_metadata=entries,
             )
-
             if not df.empty:
                 frames.append(df)
 
@@ -121,7 +111,6 @@ def main():
     allowed_product_codes = sorted(CONCEPT_IDS)
     allowed_products = ", ".join(allowed_product_codes)
 
-    # Required arguments
     parser.add_argument("-p", "--product", required=True, type=str, nargs="+",
                         choices=allowed_product_codes,
                         help=f"One or more ECOSTRESS product codes. Allowed values: {allowed_products}.")
@@ -130,8 +119,6 @@ def main():
     parser.add_argument("-s", "--start-date", required=True, type=str,
                         metavar="YYYY-MM-DD",
                         help="Start date of the search period (YYYY-MM-DD).")
-
-    # Optional arguments
     parser.add_argument("-e", "--end-date", type=str, default=None,
                         metavar="YYYY-MM-DD",
                         help="End date of the search period (YYYY-MM-DD). Defaults to start-date.")
@@ -139,6 +126,8 @@ def main():
                         help="Optional orbit number filter.")
     parser.add_argument("--scene", type=int, default=None,
                         help="Optional scene number filter.")
+    parser.add_argument("--max-cloud-cover", type=float, default=None,
+                        help="Optional maximum CMR cloud cover percentage filter.")
     parser.add_argument("-o", "--output", type=str, default=None,
                         help="Path to save the output CSV file. If not provided, results print to console.")
     parser.add_argument("--cmr-url", type=str, default=CMR_SEARCH_URL,
@@ -170,6 +159,7 @@ def main():
             end_date=args.end_date,
             orbit=args.orbit,
             scene=args.scene,
+            max_cloud_cover=args.max_cloud_cover,
             CMR_search_URL=args.cmr_url
         )
 
@@ -179,7 +169,6 @@ def main():
 
         logger.info(f"Success! Found {len(df)} matching items.")
 
-        # Handle output target
         if args.output:
             df.to_csv(args.output, index=False)
             logger.info(f"Results successfully saved to: {args.output}")
@@ -187,7 +176,6 @@ def main():
             if "granule" not in df.columns:
                 raise ValueError("Expected 'granule' column in search results.")
 
-            # Preserve first-seen ordering while removing duplicates.
             granules = df["granule"].dropna().astype(str).tolist()
             ordered_unique_granules = list(dict.fromkeys(granules))
 
