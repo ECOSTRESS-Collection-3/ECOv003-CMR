@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
+import logging
 import math
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
@@ -9,11 +11,15 @@ from rasterio.crs import CRS
 from rasterio.warp import transform
 import requests
 from sentinel_tiles import sentinel_tiles
+from tqdm.auto import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from .ECOSTRESS_CMR_search import ECOSTRESS_CMR_search
 from .ECOSTRESS_CMR_search_links import ECOSTRESS_CMR_search_entries
 from .constants import CMR_SEARCH_URL, CONCEPT_IDS
 from .interpret_ECOSTRESS_URLs import interpret_ECOSTRESS_URLs
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_granule_join_keys(granule: str) -> Tuple[str, Optional[int], Optional[int], str, str]:
@@ -27,6 +33,8 @@ def _extract_granule_join_keys(granule: str) -> Tuple[str, Optional[int], Option
 
 def _tile_bounds_wgs84(tile: str) -> Tuple[float, float, float, float]:
     """Return (minx, miny, maxx, maxy) WGS84 bounds for a Sentinel-2 MGRS tile."""
+    if hasattr(sentinel_tiles, "footprint"):
+        return sentinel_tiles.footprint(tile).bounds
     grid_obj = sentinel_tiles.grid(tile)
     if hasattr(grid_obj, "boundary_latlon"):
         return grid_obj.boundary_latlon.bounds
@@ -90,13 +98,16 @@ def find_clear_sky_et_granules(
     CMR_search_URL: str = CMR_SEARCH_URL,
     session: Optional[requests.Session] = None,
     regional_batch_threshold: int = 25,
+    cmr_workers: int = 8,
+    verbose: bool = True,
 ) -> pd.DataFrame:
     """
     Verify candidate daytime clear-sky L3T_JET overpasses that have matching
     (orbit, scene, tile, timestamp) L2T_LSTE and L3T_ETAUX granules plus a
     same-date (tile, YYYYMMDD) L2T_STARS granule, caching all variable GeoTIFF URLs.
-    Automatically switches to regional WGS84 bounding-box + temporal-chunked CMR
-    queries when len(tiles) > regional_batch_threshold.
+    Automatically switches to concurrent regional WGS84 bounding-box + temporal-chunked
+    CMR queries with live progress logging and tqdm progress bars when
+    len(tiles) > regional_batch_threshold.
     """
     required_products = ["L3T_JET", "L2T_LSTE", "L3T_ETAUX", "L2T_STARS"]
     if extra_products:
@@ -119,28 +130,67 @@ def find_clear_sky_et_granules(
     else:
         regions = _cluster_tiles_to_regional_boxes(unique_tiles)
         temporal_chunks = _iter_temporal_chunks(start_date, end_date, chunk_days=92)
+        tasks = [
+            (prod, CONCEPT_IDS[prod], bbox, region_tiles, c_start, c_end)
+            for prod in required_products
+            for bbox, region_tiles in regions
+            for c_start, c_end in temporal_chunks
+        ]
+
+        if verbose:
+            logger.info(
+                f"Querying CMR across {len(regions)} regional boxes x "
+                f"{len(temporal_chunks)} temporal chunks x {len(required_products)} products "
+                f"({len(tasks)} total requests, workers={min(cmr_workers, len(tasks))})..."
+            )
+
+        def _query_chunk(task):
+            prod, concept_id, bbox, region_tiles, c_start, c_end = task
+            entries = ECOSTRESS_CMR_search_entries(
+                concept_ID=concept_id,
+                bounding_box=bbox,
+                start_date=c_start,
+                end_date=c_end,
+                max_cloud_cover=max_cloud_cover,
+                allowed_tiles=region_tiles,
+                CMR_search_URL=CMR_search_URL,
+                session=session,
+            )
+            if not entries:
+                return prod, pd.DataFrame()
+            df_chunk = interpret_ECOSTRESS_URLs(
+                URLs=[e["URL"] for e in entries],
+                entry_metadata=entries,
+            )
+            return prod, df_chunk
+
         frames: List[pd.DataFrame] = []
-        for prod in required_products:
-            concept_id = CONCEPT_IDS[prod]
-            for bbox, region_tiles in regions:
-                for c_start, c_end in temporal_chunks:
-                    entries = ECOSTRESS_CMR_search_entries(
-                        concept_ID=concept_id,
-                        bounding_box=bbox,
-                        start_date=c_start,
-                        end_date=c_end,
-                        max_cloud_cover=max_cloud_cover,
-                        allowed_tiles=region_tiles,
-                        CMR_search_URL=CMR_search_URL,
-                        session=session,
-                    )
-                    if entries:
-                        df_chunk = interpret_ECOSTRESS_URLs(
-                            URLs=[e["URL"] for e in entries],
-                            entry_metadata=entries,
+        total_assets = 0
+        milestone_step = max(1, len(tasks) // 10)
+
+        with logging_redirect_tqdm(), ThreadPoolExecutor(
+            max_workers=max(1, min(cmr_workers, len(tasks)))
+        ) as executor:
+            futures = [executor.submit(_query_chunk, t) for t in tasks]
+            with tqdm(
+                total=len(tasks),
+                desc="CMR regional search",
+                unit="req",
+                disable=not verbose,
+            ) as pbar:
+                for completed_idx, future in enumerate(as_completed(futures), start=1):
+                    _, df_chunk = future.result()
+                    if not df_chunk.empty:
+                        frames.append(df_chunk)
+                        total_assets += len(df_chunk)
+                    pbar.set_postfix(assets=f"{total_assets:,}", refresh=False)
+                    pbar.update(1)
+                    if verbose and (completed_idx % milestone_step == 0 or completed_idx == len(tasks)):
+                        logger.info(
+                            f"  CMR discovery progress: {completed_idx}/{len(tasks)} requests "
+                            f"({100.0 * completed_idx / len(tasks):.0f}%), {total_assets:,} matching asset URLs"
                         )
-                        if not df_chunk.empty:
-                            frames.append(df_chunk)
+
         listing = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     if listing.empty:

@@ -15,6 +15,8 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import requests
+from tqdm.auto import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from .ECOSTRESS_CMR_search import ECOSTRESS_CMR_search
 from .authentication import configure_gdal_earthdata_env, setup_earthdata_session
@@ -172,8 +174,8 @@ def build_stratified_dataset(
     """
     Build a spatially and seasonally stratified ECOSTRESS Collection 3 point-sample
     dataset with persistent catalog caching, bounded HTTP stream concurrency,
-    synchronous URS cookie refresh across batches, adaptive quota refills, and
-    streaming O(1)-memory Parquet diagnostics.
+    synchronous URS cookie refresh across batches, adaptive quota refills, live
+    tqdm progress bars, and streaming O(1)-memory Parquet diagnostics.
     """
     t_start = time.perf_counter()
     timings: Dict[str, float] = {}
@@ -232,6 +234,8 @@ def build_stratified_dataset(
             max_cloud_cover=max_cloud_cover,
             extra_products=extra_products,
             session=session,
+            cmr_workers=max(1, min(8, max_workers)),
+            verbose=verbose,
         )
         if not candidate_granules.empty:
             _save_candidate_catalog(catalog_path, candidate_granules, cache_key, required_products)
@@ -242,9 +246,11 @@ def build_stratified_dataset(
         return {"total_samples": 0, "selected_granules": 0, "n_cap": 0, "timings": timings}
 
     tile_counts = candidate_granules.groupby("tile").size().to_dict()
+    tile_preview = dict(list(tile_counts.items())[:10])
+    suffix = f" ... (+{len(tile_counts) - 10} more tiles)" if len(tile_counts) > 10 else ""
     _log(
-        f"[3/6] Found {len(candidate_granules)} complete candidate overpasses across tiles: "
-        f"{tile_counts} ({timings['cmr_search_s']:.2f}s)"
+        f"[3/6] Found {len(candidate_granules):,} complete candidate overpasses across "
+        f"{len(tile_counts):,} tiles: {tile_preview}{suffix} ({timings['cmr_search_s']:.2f}s)"
     )
 
     t0 = time.perf_counter()
@@ -265,15 +271,15 @@ def build_stratified_dataset(
     )
     timings["selection_s"] = time.perf_counter() - t0
     _log(
-        f"[4/6] Stratified selection: {len(selected_granules)} granules across "
-        f"{selected_granules['tile'].nunique()} eligible tile(s) (N_cap={n_cap}, "
+        f"[4/6] Stratified selection: {len(selected_granules):,} granules across "
+        f"{selected_granules['tile'].nunique():,} eligible tile(s) (N_cap={n_cap}, "
         f"quota_K={quota_k}, candidate_draw_N={candidate_n}) ({timings['selection_s']:.2f}s)"
     )
 
     pending = selected_granules[~selected_granules["granule"].isin(completed_granules)].copy()
     _log(
-        f"[5/6] Checkpoint status: {len(completed_granules)} already completed, "
-        f"{len(pending)} pending granule(s) (batch_size={batch_size}, max_concurrent_streams={max_concurrent_streams})"
+        f"[5/6] Checkpoint status: {len(completed_granules):,} already completed, "
+        f"{len(pending):,} pending granule(s) (batch_size={batch_size}, max_concurrent_streams={max_concurrent_streams})"
     )
 
     write_lock = Lock()
@@ -423,39 +429,54 @@ def build_stratified_dataset(
     total_pending = len(pending)
     timings["cookie_warmup_s"] = 0.0
     t_extract = time.perf_counter()
+    running_samples = 0
 
     effective_batch_size = max(1, batch_size)
-    for batch_start in range(0, total_pending, effective_batch_size):
-        batch_df_slice = pending.iloc[batch_start : batch_start + effective_batch_size]
-        t_warm = time.perf_counter()
-        _log(
-            f"[5/6] Pre-warming GDAL /vsicurl/ Earthdata cookies "
-            f"(granules {batch_start + 1}..{batch_start + len(batch_df_slice)} of {total_pending})"
-        )
-        with configure_gdal_earthdata_env(session=session, warmup_url=warmup_url):
-            timings["cookie_warmup_s"] += time.perf_counter() - t_warm
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(
-                        _process_granule,
-                        row.to_dict(),
-                        batch_start + local_idx,
-                        total_pending,
-                        random_state + batch_start + local_idx,
-                    ): row["granule"]
-                    for local_idx, (_, row) in enumerate(batch_df_slice.iterrows())
-                }
-                for future in as_completed(futures):
-                    gid = futures[future]
-                    result_df = future.result()
-                    with write_lock:
-                        if not result_df.empty:
-                            part_counter += 1
-                            part_stem = os.path.join(output_dir, f"dataset_part_{part_counter:04d}")
-                            result_df.to_parquet(f"{part_stem}.parquet", index=False)
-                            if export_csv:
-                                result_df.to_csv(f"{part_stem}.csv", index=False)
-                        _append_completed_manifest(manifest_path, gid)
+    with logging_redirect_tqdm(), tqdm(
+        total=total_pending,
+        desc="Extracting COGs",
+        unit="granule",
+        disable=not verbose or total_pending == 0,
+    ) as pbar:
+        for batch_start in range(0, total_pending, effective_batch_size):
+            batch_df_slice = pending.iloc[batch_start : batch_start + effective_batch_size]
+            t_warm = time.perf_counter()
+            _log(
+                f"[5/6] Pre-warming GDAL /vsicurl/ Earthdata cookies "
+                f"(granules {batch_start + 1}..{batch_start + len(batch_df_slice)} of {total_pending})"
+            )
+            with configure_gdal_earthdata_env(session=session, warmup_url=warmup_url):
+                timings["cookie_warmup_s"] += time.perf_counter() - t_warm
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {
+                        executor.submit(
+                            _process_granule,
+                            row.to_dict(),
+                            batch_start + local_idx,
+                            total_pending,
+                            random_state + batch_start + local_idx,
+                        ): row["granule"]
+                        for local_idx, (_, row) in enumerate(batch_df_slice.iterrows())
+                    }
+                    for future in as_completed(futures):
+                        gid = futures[future]
+                        result_df = future.result()
+                        with write_lock:
+                            if not result_df.empty:
+                                part_counter += 1
+                                part_stem = os.path.join(output_dir, f"dataset_part_{part_counter:04d}")
+                                result_df.to_parquet(f"{part_stem}.parquet", index=False)
+                                if export_csv:
+                                    result_df.to_csv(f"{part_stem}.csv", index=False)
+                                running_samples += len(result_df)
+                            _append_completed_manifest(manifest_path, gid)
+                        elapsed = max(1e-6, (time.perf_counter() - t_extract) - timings["cookie_warmup_s"])
+                        pbar.set_postfix(
+                            samples=f"{running_samples:,}",
+                            rate=f"{running_samples / elapsed:.1f}/s",
+                            refresh=False,
+                        )
+                        pbar.update(1)
 
     timings["extraction_s"] = max(0.0, (time.perf_counter() - t_extract) - timings["cookie_warmup_s"])
 
@@ -498,7 +519,7 @@ def build_stratified_dataset(
     }
 
     _log(
-        f"[6/6] Done! {n_samples} samples in {timings['total_s']:.2f}s "
+        f"[6/6] Done! {n_samples:,} samples in {timings['total_s']:.2f}s "
         f"({samples_per_sec:.2f} samples/s; amortized 1M estimate: {performance['amortized_global_1m_estimate_human']})"
     )
 

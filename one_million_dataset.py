@@ -21,7 +21,7 @@ Usage:
 """
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
@@ -64,13 +64,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./uq_dataset_1m",
+        default="./one_million_dataset",
         help="Directory for partitioned Parquet outputs, checkpoint manifest, and catalog cache (default: ./uq_dataset_1m).",
     )
     parser.add_argument(
         "--start-date",
         type=str,
-        default="2026-06-01",
+        default="2025-10-31",
         help="Acquisition window start date in YYYY-MM-DD format (default: 2026-06-01).",
     )
     parser.add_argument(
@@ -212,7 +212,7 @@ def main() -> None:
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(
             {
-                "generated_at_utc": datetime.utcnow().isoformat() + "Z",
+                "generated_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "config": vars(args),
                 "summary": _serialize_summary(summary),
             },
