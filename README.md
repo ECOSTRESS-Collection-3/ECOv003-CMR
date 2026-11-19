@@ -15,10 +15,11 @@
 5. [Python API: Searching NASA CMR](#python-api-searching-nasa-cmr)
 6. [Python API: Downloading & Opening Granules](#python-api-downloading--opening-granules)
 7. [Python API: Point Sampling & `/vsicurl/` Batch Extraction](#python-api-point-sampling--vsicurl-batch-extraction)
-8. [Python API: Global & Regional Stratified Dataset Builder](#python-api-global--regional-stratified-dataset-builder)
-9. [Python API: Granule ID, Filename & Tile Utilities](#python-api-granule-id-filename--tile-utilities)
-10. [Examples](#examples)
-11. [Development and Testing](#development-and-testing)
+8. [Available Sampling Layers](#available-sampling-layers)
+9. [Python API: Global & Regional Stratified Dataset Builder](#python-api-global--regional-stratified-dataset-builder)
+10. [Python API: Granule ID, Filename & Tile Utilities](#python-api-granule-id-filename--tile-utilities)
+11. [Examples](#examples)
+12. [Development and Testing](#development-and-testing)
 
 ---
 
@@ -44,7 +45,7 @@ pip install -e ".[dev]"
 
 CMR metadata searches are public. Downloading granule files and sampling raster URLs require a NASA Earthdata Login account ([urs.earthdata.nasa.gov](https://urs.earthdata.nasa.gov/)) with LP DAAC applications authorized.
 
-`setup_earthdata_session()` resolves credentials in the following priority order:
+`setup_earthdata_session()` mounts a 64-socket HTTP connection pool (`pool_connections=64`, `pool_maxsize=64`) to support high-concurrency COG and sidecar reads cleanly, and resolves credentials in the following priority order:
 
 1. **Explicit arguments** passed to `setup_earthdata_session(username=..., password=...)`
 2. **Environment variables:**
@@ -104,32 +105,16 @@ Installing `ECOv003-CMR` registers two CLI commands: `ECOv003-search` and `ECOv0
 
 ```bash
 # Print matching unique granule IDs to stdout
-ECOv003-search \
-  --product L2T_LSTE L2T_STARS L3T_JET \
-  --tile 52NHN 53NMH \
-  --start-date 2026-06-01 \
-  --end-date 2026-06-07
+ECOv003-search   --product L2T_LSTE L2T_STARS L3T_JET   --tile 52NHN 53NMH   --start-date 2026-06-01   --end-date 2026-06-07
 
 # Filter by orbit/scene/cloud cover and export full file listing to CSV
-ECOv003-search \
-  --product L2T_LSTE \
-  --tile 52NHN \
-  --start-date 2026-06-01 \
-  --orbit 44814 \
-  --scene 1 \
-  --max-cloud-cover 20 \
-  --output ecostress-files.csv
+ECOv003-search   --product L2T_LSTE   --tile 52NHN   --start-date 2026-06-01   --orbit 44814   --scene 1   --max-cloud-cover 20   --output ecostress-files.csv
 ```
 
 ### `ECOv003-download`
 
 ```bash
-ECOv003-download \
-  --product L2T_LSTE L2T_STARS L3T_ETAUX \
-  --tile 11SLT 11SPS \
-  --start-date 2026-06-01 \
-  --end-date 2026-06-07 \
-  --parent-directory ~/data/ECOSTRESS_v003
+ECOv003-download   --product L2T_LSTE L2T_STARS L3T_ETAUX   --tile 11SLT 11SPS   --start-date 2026-06-01   --end-date 2026-06-07   --parent-directory ~/data/ECOSTRESS_v003
 ```
 
 ---
@@ -206,11 +191,28 @@ print(summarize_point_samples(samples))
 
 ---
 
+## Available Sampling Layers
+
+Point sampling and stratified dataset functions accept any combination of the following Collection 3 layer names (`LAYER_MAPPING` in `ECOv003_CMR/point_sampling.py`):
+
+| Product | Supported Layer Names | Notes / Units |
+|---|---|---|
+| `L2T_LSTE` | `ST_C`, `LST`, `LST_err`, `QC`, `emissivity`, `EmisWB`, `Emis1`–`Emis5`, `Emis1_err`–`Emis5_err`, `view_zenith`, `height` | `ST_C` is automatically converted from Kelvin (`LST - 273.15`); `emissivity` aliases `EmisWB` |
+| `L2T_STARS` | `NDVI`, `NDVI-UQ`, `albedo`, `albedo-UQ` | Daily surface priors joined by `(tile, YYYYMMDD)` |
+| `L3T_ETAUX` | `Ta_C`, `Ta`, `RH`, `SM`, `Rg`, `Rn`, `cloud`, `water` | `Ta_C` and `Ta` both read `Ta` (already in °C) |
+| `L3T_JET` | `PTJPLSMinst`, `PTJPLSMdaily`, `PTJPLSMcanopy`, `PTJPLSMsoil`, `PTJPLSMinterception`, `ETdaily`, `ETuncertainty`, `ETinstUncertainty`, `STICJPLinst`, `STICJPLdaily`, `STICJPLcanopy`, `BESSJPLdaily`, `PMJPLdaily` | Evapotranspiration & ensemble partitioning |
+| `L4T_ESI` | `ESI` | Evaporative Stress Index |
+| `L4T_WUE` | `WUE` | Water Use Efficiency |
+
+---
+
 ## Python API: Global & Regional Stratified Dataset Builder
 
-`build_stratified_dataset()` scales stratified point-sample dataset generation to global multi-million-sample campaigns (~9.8s per granule across 16 science/UQ layers; ~45 minutes amortized for 1,000,000 samples across 4,000 global granules on 16 workers) with:
-- **Regional Bounding-Box & Temporal-Chunked CMR Discovery:** Automatically clusters tile sets larger than `regional_batch_threshold=25` into $30^\circ \times 30^\circ$ WGS84 regional boxes and 92-day temporal chunks.
-- **Persistent Candidate Catalog Caching (`catalog_path`, `refresh_catalog`):** Stores SHA-256 cache-keyed `candidate_granules.parquet` catalogs for instant offline restarts.
+`build_stratified_dataset()` scales stratified point-sample dataset generation to global multi-million-sample campaigns (~8.7s–9.6s per granule across 16 science/UQ layers; ~40 minutes amortized for 1,000,000 samples across 4,000 global granules on 16 workers) with:
+- **CMR `granules.csv` Discovery & `POST` Wildcard Resolution:** Enumerates global `L3T_JET` catalogs across 5-day parallel windows (~97% smaller payloads than JSON/UMM-JSON, zero spatial-overlap duplicates) and resolves `.tif` and `.json` asset URLs lazily via `POST` `readable_granule_name[]` batches strictly for selected granules.
+- **Sidecar `QAPercentCloudCover` Filtering & Rejection-Aware Backfill:** Evaluates `max_cloud_cover` concurrently against per-granule `.json` metadata sidecars (`ProductMetadata.QAPercentCloudCover`) and automatically backfills dropped tiles using empirical cloud-rejection multipliers.
+- **A Priori Sampling Design & Dry-Run Mode (`plan_stratified_sampling()`, `estimate_cloud_cover_distribution()`, `dry_run=True`):** Forecasts eligible MGRS tile counts, latitudinal biome representation (`tropical`, `temperate`, `boreal`), effective $N_{	ext{cap}}$, selected granules $G$, per-granule pixel quota $K$, and estimated wall time before reading COGs.
+- **Persistent Candidate Catalog Caching (`catalog_path`, `refresh_catalog`):** Stores SHA-256 cache-keyed `candidate_granules.parquet` catalogs for <0.1s offline restarts.
 - **Bounded HTTP Stream Concurrency (`max_concurrent_streams`, `layer_workers`):** Caps simultaneous `/vsicurl/` connections via a shared `threading.Semaphore`.
 - **Synchronous Batch Cookie Re-Warming (`batch_size`):** Refreshes Netscape URS cookies across synchronous granule batches and cleans up temporary cookie files on exit.
 - **Adaptive Per-Granule Quota Refills:** Re-draws unvisited clear-sky pixels when multi-product `NaN` dropouts reduce accepted samples below `quota_k`.
@@ -227,20 +229,22 @@ summary = build_stratified_dataset(
     output_dir="./stratified_dataset_output",
     start_date=date(2026, 6, 1),
     end_date=date(2026, 6, 30),
-    tiles=["11SLT", "11SPS", "52NHN"],  # Omit (tiles=None) to run across all global land tiles
+    tiles=["11SLT", "11SPS", "52NHN", "53NMH", "20LLQ"],  # Omit (tiles=None) for all global land tiles
     target_total_samples=1000,
-    min_granules_floor=1,
+    min_granules_floor=2,
     dispersion_strategy="stratified_grid",
-    max_workers=4,
+    max_workers=12,
     layer_workers=8,
-    max_concurrent_streams=32,
+    max_concurrent_streams=48,
     batch_size=250,
     refresh_catalog=False,
+    dry_run=False,
     layers=UQ_LAYERS,
     export_csv=True,
     session=session,
 )
 
+print(summary["stratification_plan"])
 print(summary["coverage_summary"])
 ```
 
@@ -260,6 +264,41 @@ print(find_sentinel2_tile(-118.2437, 34.0522, return_all=True))
 # Include ocean-only MGRS tiles if needed
 print(find_sentinel2_tile(-140.0, 0.0, land_only=False))  # '07MFV'
 ```
+
+---
+
+## Examples
+
+### Large-Scale Stratified Dataset Runners
+
+- **`one_hundred_dataset.py`:** Multi-biome 100-observation pilot across 5 Sentinel-2 MGRS tiles (`11SLT`, `11SPS`, `52NHN`, `53NMH`, and humid-tropical `20LLQ`), writing partitioned Parquet/CSV outputs and `dataset_summary.json` into `./experimental_data/one_hundred_dataset`:
+  ```bash
+  # Pre-flight capacity & biome plan dry run (no COG reads)
+  python one_hundred_dataset.py --dry-run
+
+  # Full 100-observation extraction (~14-35s end-to-end)
+  python one_hundred_dataset.py
+  ```
+- **`one_million_dataset.py`:** Global 1,000,000-observation stratified dataset generator across all 14,749 ECOSTRESS-covered land MGRS tiles (`2025-10-31` to `2026-10-31`), writing resumable checkpoints into `./experimental_data/one_million_dataset`:
+  ```bash
+  # Step 1: Pre-flight dry run (~2m) to cache candidate_granules.parquet and inspect capacity plan
+  python one_million_dataset.py --dry-run
+
+  # Step 2: Execute global 1M-sample extraction (resumable via completed_granules.txt)
+  python one_million_dataset.py
+  ```
+- **`count_L3T_JET_scenes_by_cloud_percent.py`:** Global `L3T_JET` archive cloud-cover census using CMR `granules.csv` and concurrent `.json` sidecar `QAPercentCloudCover` inspection:
+  ```bash
+  python count_L3T_JET_scenes_by_cloud_percent.py --sample-size 2000
+  ```
+
+### Additional Scripts in `examples/`
+
+- `examples/point_sampling_demo.py` — Single-coordinate `L2T_LSTE` + `L2T_STARS` sampling in Los Angeles
+- `examples/geodataframe_sampling_demo.py` — Multi-site `GeoDataFrame` date-range sampling
+- `examples/csv_to_geodataframe_demo.py` — Loading site coordinates from CSV and exporting enriched ECOSTRESS observations
+- `examples/download_granules_demo.py` — Downloading `L2T_LSTE` and `L2T_STARS` granules locally
+- `examples/stratified_sampling_demo.py` — Single-tile stratified sampling benchmark (`make test-sampler`)
 
 ---
 

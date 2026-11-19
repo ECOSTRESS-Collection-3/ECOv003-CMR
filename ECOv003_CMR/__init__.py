@@ -16,6 +16,8 @@ from .stratified_sampling import (
     compute_per_granule_quota,
     extract_valid_swath_mask,
     sample_granule_coordinates,
+    plan_stratified_sampling,
+    estimate_cloud_cover_distribution,
 )
 from .stratified_dataset_builder import build_stratified_dataset, DEFAULT_STRATIFIED_LAYERS, UQ_LAYERS
 

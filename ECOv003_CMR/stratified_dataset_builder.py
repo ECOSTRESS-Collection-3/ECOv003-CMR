@@ -15,6 +15,8 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import requests
+from tqdm.auto import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from .ECOSTRESS_CMR_search import ECOSTRESS_CMR_search
 from .authentication import configure_gdal_earthdata_env, setup_earthdata_session
@@ -27,6 +29,8 @@ from .stratified_sampling import (
     compute_per_granule_quota,
     extract_valid_swath_mask,
     find_clear_sky_et_granules,
+    plan_stratified_sampling,
+    resolve_granule_asset_urls,
     sample_granule_coordinates,
     select_stratified_granules,
 )
@@ -64,6 +68,17 @@ def _format_duration(seconds: float) -> str:
     if seconds < 86400:
         return f"{seconds / 3600:.2f}h"
     return f"{seconds / 86400:.2f}d"
+
+
+def _backfill_multiplier_for_cloud_cover(max_cloud_cover: Optional[float]) -> int:
+    """Scale Stage [4/6] backfill candidate slice to empirical sidecar rejection rates."""
+    if max_cloud_cover is None or max_cloud_cover >= 50.0:
+        return 2
+    if max_cloud_cover >= 20.0:
+        return 4
+    if max_cloud_cover >= 10.0:
+        return 5
+    return 12
 
 
 def _load_completed_manifest(manifest_path: str) -> set:
@@ -158,22 +173,25 @@ def build_stratified_dataset(
     grid_divisions: int = 6,
     layers: Optional[List[str]] = None,
     max_cloud_cover: Optional[float] = 20.0,
-    max_workers: int = 8,
+    max_workers: int = 12,
     layer_workers: int = 8,
-    max_concurrent_streams: int = 32,
+    max_concurrent_streams: int = 48,
     batch_size: int = 250,
     catalog_path: Optional[str] = None,
     refresh_catalog: bool = False,
     export_csv: bool = False,
+    dry_run: bool = False,
     random_state: int = 42,
     session: Optional[requests.Session] = None,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
     Build a spatially and seasonally stratified ECOSTRESS Collection 3 point-sample
-    dataset with persistent catalog caching, bounded HTTP stream concurrency,
-    synchronous URS cookie refresh across batches, adaptive quota refills, and
-    streaming O(1)-memory Parquet diagnostics.
+    dataset with CMR CSV catalog discovery, pre-flight capacity & biome planning,
+    lazy post-stratification asset URL & sidecar QAPercentCloudCover resolution,
+    rejection-aware backfill, bounded HTTP stream concurrency, synchronous URS
+    cookie refresh across batches, adaptive quota refills, and O(1)-memory
+    Parquet diagnostics.
     """
     t_start = time.perf_counter()
     timings: Dict[str, float] = {}
@@ -219,7 +237,7 @@ def build_stratified_dataset(
         required_products=required_products,
     )
     if candidate_granules is not None:
-        _log(f"[3/6] Loaded {len(candidate_granules)} cached candidate overpasses from {catalog_path}")
+        _log(f"[3/6] Loaded {len(candidate_granules):,} cached candidate overpasses from {catalog_path}")
     else:
         _log(
             f"[3/6] Querying CMR for complete clear-sky ET overpasses "
@@ -231,7 +249,11 @@ def build_stratified_dataset(
             end_date=end_date,
             max_cloud_cover=max_cloud_cover,
             extra_products=extra_products,
+            min_granules_floor=min_granules_floor,
+            resolve_urls=False,
             session=session,
+            cmr_workers=max(1, min(6, max_workers)),
+            verbose=verbose,
         )
         if not candidate_granules.empty:
             _save_candidate_catalog(catalog_path, candidate_granules, cache_key, required_products)
@@ -239,13 +261,33 @@ def build_stratified_dataset(
 
     if candidate_granules.empty:
         _log("[3/6] No complete multi-product clear-sky ET granules found for the given window.")
-        return {"total_samples": 0, "selected_granules": 0, "n_cap": 0, "timings": timings}
+        return {
+            "total_samples": 0,
+            "selected_granules": 0,
+            "n_cap": 0,
+            "dry_run": dry_run,
+            "stratification_plan": pd.DataFrame(),
+            "timings": timings,
+        }
 
     tile_counts = candidate_granules.groupby("tile").size().to_dict()
+    tile_preview = dict(list(tile_counts.items())[:10])
+    suffix = f" ... (+{len(tile_counts) - 10} more tiles)" if len(tile_counts) > 10 else ""
     _log(
-        f"[3/6] Found {len(candidate_granules)} complete candidate overpasses across tiles: "
-        f"{tile_counts} ({timings['cmr_search_s']:.2f}s)"
+        f"[3/6] Found {len(candidate_granules):,} candidate overpasses across "
+        f"{len(tile_counts):,} tiles: {tile_preview}{suffix} ({timings['cmr_search_s']:.2f}s)"
     )
+
+    candidate_floors = sorted({1, 2, 4, 6, 8, int(min_granules_floor)})
+    stratification_plan = plan_stratified_sampling(
+        catalog_df=candidate_granules,
+        target_total_samples=target_total_samples,
+        candidate_floors=candidate_floors,
+        max_cloud_cover=max_cloud_cover,
+        max_workers=max_workers,
+    )
+    if verbose and not stratification_plan.empty:
+        _log("[3/6] Pre-flight stratification capacity plan:\n" + stratification_plan.to_string(index=False))
 
     t0 = time.perf_counter()
     selected_granules, n_cap = select_stratified_granules(
@@ -256,7 +298,98 @@ def build_stratified_dataset(
     )
     if selected_granules.empty:
         _log(f"[4/6] No tiles met min_granules_floor={min_granules_floor}.")
-        return {"total_samples": 0, "selected_granules": 0, "n_cap": 0, "timings": timings}
+        return {
+            "total_samples": 0,
+            "selected_granules": 0,
+            "n_cap": 0,
+            "dry_run": dry_run,
+            "stratification_plan": stratification_plan,
+            "timings": timings,
+        }
+
+    if dry_run:
+        quota_k, candidate_n = compute_per_granule_quota(
+            num_selected_granules=len(selected_granules),
+            target_total_samples=target_total_samples,
+            oversample_factor=oversample_factor,
+        )
+        timings["selection_s"] = time.perf_counter() - t0
+        timings["total_s"] = time.perf_counter() - t_start
+        _log(
+            f"[4/6] Dry-run complete: {len(selected_granules):,} candidate granules across "
+            f"{selected_granules['tile'].nunique():,} eligible tile(s) (N_cap={n_cap}, "
+            f"quota_K={quota_k}, candidate_draw_N={candidate_n}). Skipping Stage [5/6] COG extraction."
+        )
+        return {
+            "total_samples": 0,
+            "selected_granules": len(selected_granules),
+            "n_cap": n_cap,
+            "quota_k": quota_k,
+            "dry_run": True,
+            "stratification_plan": stratification_plan,
+            "coverage_summary": pd.DataFrame(),
+            "performance": {"timings_s": {k: round(v, 3) for k, v in timings.items()}},
+        }
+
+    # Resolve GeoTIFF asset URLs & sidecar QAPercentCloudCover lazily for selected granules
+    if "variable_urls" not in selected_granules.columns or not selected_granules["variable_urls"].apply(
+        lambda d: isinstance(d, dict) and len(d) > 0
+    ).all():
+        resolved_selected = resolve_granule_asset_urls(
+            granules_df=selected_granules,
+            extra_products=extra_products,
+            max_cloud_cover=max_cloud_cover,
+            session=session,
+            cmr_workers=max(1, min(6, max_workers)),
+            verbose=verbose,
+        )
+        # Backfill any tile that lost a granule due to sidecar cloud cover or a missing companion
+        if len(resolved_selected) < len(selected_granules):
+            selected_set = set(selected_granules["granule"])
+            remaining_candidates = candidate_granules[
+                ~candidate_granules["granule"].isin(selected_set)
+            ]
+            resolved_counts = resolved_selected.groupby("tile").size().to_dict() if not resolved_selected.empty else {}
+            deficits = {
+                t: n_cap - resolved_counts.get(t, 0)
+                for t in selected_granules["tile"].unique()
+                if resolved_counts.get(t, 0) < n_cap
+            }
+            if deficits and not remaining_candidates.empty:
+                backfill_mult = _backfill_multiplier_for_cloud_cover(max_cloud_cover)
+                backfill_rows = []
+                for t, need in deficits.items():
+                    t_pool = remaining_candidates[remaining_candidates["tile"] == t].head(need * backfill_mult)
+                    if not t_pool.empty:
+                        backfill_rows.append(t_pool)
+                if backfill_rows:
+                    backfill_resolved = resolve_granule_asset_urls(
+                        granules_df=pd.concat(backfill_rows, ignore_index=True),
+                        extra_products=extra_products,
+                        max_cloud_cover=max_cloud_cover,
+                        session=session,
+                        cmr_workers=max(1, min(6, max_workers)),
+                        verbose=False,
+                    )
+                    if not backfill_resolved.empty:
+                        combined = pd.concat([resolved_selected, backfill_resolved], ignore_index=True)
+                        resolved_selected = (
+                            combined.groupby("tile", group_keys=False)
+                            .head(n_cap)
+                            .reset_index(drop=True)
+                        )
+        selected_granules = resolved_selected
+
+    if selected_granules.empty:
+        _log("[4/6] No complete clear-sky multi-product granules remained after URL & sidecar resolution.")
+        return {
+            "total_samples": 0,
+            "selected_granules": 0,
+            "n_cap": 0,
+            "dry_run": False,
+            "stratification_plan": stratification_plan,
+            "timings": timings,
+        }
 
     quota_k, candidate_n = compute_per_granule_quota(
         num_selected_granules=len(selected_granules),
@@ -265,15 +398,15 @@ def build_stratified_dataset(
     )
     timings["selection_s"] = time.perf_counter() - t0
     _log(
-        f"[4/6] Stratified selection: {len(selected_granules)} granules across "
-        f"{selected_granules['tile'].nunique()} eligible tile(s) (N_cap={n_cap}, "
+        f"[4/6] Stratified selection: {len(selected_granules):,} granules across "
+        f"{selected_granules['tile'].nunique():,} eligible tile(s) (N_cap={n_cap}, "
         f"quota_K={quota_k}, candidate_draw_N={candidate_n}) ({timings['selection_s']:.2f}s)"
     )
 
     pending = selected_granules[~selected_granules["granule"].isin(completed_granules)].copy()
     _log(
-        f"[5/6] Checkpoint status: {len(completed_granules)} already completed, "
-        f"{len(pending)} pending granule(s) (batch_size={batch_size}, max_concurrent_streams={max_concurrent_streams})"
+        f"[5/6] Checkpoint status: {len(completed_granules):,} already completed, "
+        f"{len(pending):,} pending granule(s) (batch_size={batch_size}, max_concurrent_streams={max_concurrent_streams})"
     )
 
     write_lock = Lock()
@@ -423,39 +556,54 @@ def build_stratified_dataset(
     total_pending = len(pending)
     timings["cookie_warmup_s"] = 0.0
     t_extract = time.perf_counter()
+    running_samples = 0
 
     effective_batch_size = max(1, batch_size)
-    for batch_start in range(0, total_pending, effective_batch_size):
-        batch_df_slice = pending.iloc[batch_start : batch_start + effective_batch_size]
-        t_warm = time.perf_counter()
-        _log(
-            f"[5/6] Pre-warming GDAL /vsicurl/ Earthdata cookies "
-            f"(granules {batch_start + 1}..{batch_start + len(batch_df_slice)} of {total_pending})"
-        )
-        with configure_gdal_earthdata_env(session=session, warmup_url=warmup_url):
-            timings["cookie_warmup_s"] += time.perf_counter() - t_warm
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(
-                        _process_granule,
-                        row.to_dict(),
-                        batch_start + local_idx,
-                        total_pending,
-                        random_state + batch_start + local_idx,
-                    ): row["granule"]
-                    for local_idx, (_, row) in enumerate(batch_df_slice.iterrows())
-                }
-                for future in as_completed(futures):
-                    gid = futures[future]
-                    result_df = future.result()
-                    with write_lock:
-                        if not result_df.empty:
-                            part_counter += 1
-                            part_stem = os.path.join(output_dir, f"dataset_part_{part_counter:04d}")
-                            result_df.to_parquet(f"{part_stem}.parquet", index=False)
-                            if export_csv:
-                                result_df.to_csv(f"{part_stem}.csv", index=False)
-                        _append_completed_manifest(manifest_path, gid)
+    with logging_redirect_tqdm(), tqdm(
+        total=total_pending,
+        desc="Extracting COGs",
+        unit="granule",
+        disable=not verbose or total_pending == 0,
+    ) as pbar:
+        for batch_start in range(0, total_pending, effective_batch_size):
+            batch_df_slice = pending.iloc[batch_start : batch_start + effective_batch_size]
+            t_warm = time.perf_counter()
+            _log(
+                f"[5/6] Pre-warming GDAL /vsicurl/ Earthdata cookies "
+                f"(granules {batch_start + 1}..{batch_start + len(batch_df_slice)} of {total_pending})"
+            )
+            with configure_gdal_earthdata_env(session=session, warmup_url=warmup_url):
+                timings["cookie_warmup_s"] += time.perf_counter() - t_warm
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {
+                        executor.submit(
+                            _process_granule,
+                            row.to_dict(),
+                            batch_start + local_idx,
+                            total_pending,
+                            random_state + batch_start + local_idx,
+                        ): row["granule"]
+                        for local_idx, (_, row) in enumerate(batch_df_slice.iterrows())
+                    }
+                    for future in as_completed(futures):
+                        gid = futures[future]
+                        result_df = future.result()
+                        with write_lock:
+                            if not result_df.empty:
+                                part_counter += 1
+                                part_stem = os.path.join(output_dir, f"dataset_part_{part_counter:04d}")
+                                result_df.to_parquet(f"{part_stem}.parquet", index=False)
+                                if export_csv:
+                                    result_df.to_csv(f"{part_stem}.csv", index=False)
+                                running_samples += len(result_df)
+                            _append_completed_manifest(manifest_path, gid)
+                        elapsed = max(1e-6, (time.perf_counter() - t_extract) - timings["cookie_warmup_s"])
+                        pbar.set_postfix(
+                            samples=f"{running_samples:,}",
+                            rate=f"{running_samples / elapsed:.1f}/s",
+                            refresh=False,
+                        )
+                        pbar.update(1)
 
     timings["extraction_s"] = max(0.0, (time.perf_counter() - t_extract) - timings["cookie_warmup_s"])
 
@@ -498,7 +646,7 @@ def build_stratified_dataset(
     }
 
     _log(
-        f"[6/6] Done! {n_samples} samples in {timings['total_s']:.2f}s "
+        f"[6/6] Done! {n_samples:,} samples in {timings['total_s']:.2f}s "
         f"({samples_per_sec:.2f} samples/s; amortized 1M estimate: {performance['amortized_global_1m_estimate_human']})"
     )
 
@@ -507,6 +655,8 @@ def build_stratified_dataset(
         "selected_granules": n_granules,
         "n_cap": n_cap,
         "quota_k": quota_k,
+        "dry_run": False,
+        "stratification_plan": stratification_plan,
         "coverage_summary": coverage_summary,
         "performance": performance,
     }
