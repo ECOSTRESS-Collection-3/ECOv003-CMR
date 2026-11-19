@@ -3,6 +3,7 @@ import sys
 from typing import List, Optional, Union
 import logging
 import pandas as pd
+import requests
 from datetime import date
 from dateutil import parser
 
@@ -22,7 +23,8 @@ def ECOSTRESS_CMR_search(
         scene: int = None,
         use_tile_bounds: bool = True,
         max_cloud_cover: Optional[float] = None,
-        CMR_search_URL: str = CMR_SEARCH_URL) -> pd.DataFrame:
+        CMR_search_URL: str = CMR_SEARCH_URL,
+        session: Optional[requests.Session] = None) -> pd.DataFrame:
     """
     Search the CMR API for ECOSTRESS granules and return parsed results.
     """
@@ -62,6 +64,7 @@ def ECOSTRESS_CMR_search(
                     start_date=start_date.strftime("%Y-%m-%d"),
                     end_date=end_date.strftime("%Y-%m-%d"),
                     CMR_search_URL=CMR_search_URL,
+                    session=session,
                 )
                 entries = None
             else:
@@ -73,6 +76,7 @@ def ECOSTRESS_CMR_search(
                     use_tile_bounds=use_tile_bounds,
                     max_cloud_cover=max_cloud_cover,
                     CMR_search_URL=CMR_search_URL,
+                    session=session,
                 )
                 URLs = [e["URL"] for e in entries]
             df = interpret_ECOSTRESS_URLs(

@@ -119,7 +119,7 @@ def test_download_opens_collection3_granules(
     assert granule.granule_name == granule_name
 
 
-def test_download_granule_accepts_legacy_aquisition_date_alias(monkeypatch, tmp_path):
+def test_download_granule_accepts_legacy_aquisition_date_alias_with_warning(monkeypatch, tmp_path):
     granule_name = "ECOv003_L2T_LSTE_44814_001_52NHN_20260601T000306_02"
     granule_directory = tmp_path / granule_name
     granule_directory.mkdir()
@@ -136,11 +136,12 @@ def test_download_granule_accepts_legacy_aquisition_date_alias(monkeypatch, tmp_
         mock_download_files,
     )
 
-    granule = download_module.download_ECOSTRESS_granule(
-        product="L2T_LSTE",
-        tile="52NHN",
-        aquisition_date="2026-06-01",
-    )
+    with pytest.warns(DeprecationWarning, match="aquisition_date"):
+        granule = download_module.download_ECOSTRESS_granule(
+            product="L2T_LSTE",
+            tile="52NHN",
+            aquisition_date="2026-06-01",
+        )
 
     assert recorded["acquisition_date"] == "2026-06-01"
     assert granule.granule_name == granule_name

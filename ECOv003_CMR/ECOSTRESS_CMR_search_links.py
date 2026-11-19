@@ -1,5 +1,6 @@
+import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import requests
 from datetime import date
 from dateutil import parser
@@ -8,6 +9,8 @@ from sentinel_tiles import sentinel_tiles
 
 from .constants import CMR_SEARCH_URL
 from .granule_ID_from_filename import granule_ID_from_filename
+
+logger = logging.getLogger(__name__)
 
 
 def _request_with_backoff(
@@ -18,7 +21,7 @@ def _request_with_backoff(
     max_retries: int = 4,
     backoff_base: float = 1.5,
 ) -> requests.Response:
-    requester = session.get if session is not None else requests.get
+    requester = session.get if (session is not None and not getattr(session, "auth", None)) else requests.get
     for attempt in range(max_retries):
         response = requester(url, params=params, headers=headers)
         if getattr(response, "status_code", 200) in (429, 503) and attempt < max_retries - 1:
@@ -40,6 +43,7 @@ def ECOSTRESS_CMR_search_entries(
     end_date: Union[date, str] = None,
     use_tile_bounds: bool = True,
     max_cloud_cover: Optional[float] = None,
+    allowed_tiles: Optional[Set[str]] = None,
     CMR_search_URL: str = CMR_SEARCH_URL,
     session: Optional[requests.Session] = None,
 ) -> List[Dict[str, Any]]:
@@ -54,15 +58,16 @@ def ECOSTRESS_CMR_search_entries(
     if bounding_box is not None:
         bbox_str = f"{bounding_box[0]},{bounding_box[1]},{bounding_box[2]},{bounding_box[3]}"
     elif tile is not None:
-        geometry = sentinel_tiles.grid(tile)
-        if use_tile_bounds and hasattr(geometry, "bounds"):
-            minx, miny, maxx, maxy = geometry.bounds
+        if use_tile_bounds:
+            minx, miny, maxx, maxy = sentinel_tiles.footprint(tile).bounds
             bbox_str = f"{minx},{miny},{maxx},{maxy}"
         else:
-            centroid = geometry.centroid_latlon
+            centroid = sentinel_tiles.centroid(tile)
             bbox_str = f"{centroid.x},{centroid.y},{centroid.x},{centroid.y}"
     else:
         raise ValueError("Either 'tile' or 'bounding_box' must be provided")
+
+    target_tiles = set(allowed_tiles) if allowed_tiles is not None else ({tile} if tile is not None else None)
 
     granule_search_URL = f"{CMR_search_URL}granules.json"
     params = {
@@ -100,13 +105,14 @@ def ECOSTRESS_CMR_search_entries(
                     and href.endswith((".tif", ".json", ".aux.xml", ".jpeg"))
                 ):
                     continue
-                if tile is not None:
+                if target_tiles is not None:
                     try:
                         gid = granule_ID_from_filename(href)
-                        if gid.tile != tile:
-                            continue
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug(f"Skipping unparseable CMR asset URL {href}: {exc}")
+                        continue
+                    if gid.tile not in target_tiles:
+                        continue
                 records.append(
                     {
                         "URL": href,

@@ -5,15 +5,17 @@ These tests verify the point sampling API without requiring actual
 network requests or authentication.
 """
 
-import pytest
-import pandas as pd
+from datetime import datetime
+import importlib
+from unittest.mock import Mock, patch
+
 import geopandas as gpd
 import numpy as np
-from datetime import datetime, date
-from shapely.geometry import Point
-from unittest.mock import Mock, patch
+import pandas as pd
+import pytest
 from rasterio.io import MemoryFile
 from rasterio.transform import from_origin
+from shapely.geometry import Point
 
 
 def test_import_point_sampling():
@@ -23,7 +25,7 @@ def test_import_point_sampling():
         sample_point_from_url,
         sample_points_from_geodataframe,
         sample_points_over_date_range,
-        find_sentinel2_tile
+        find_sentinel2_tile,
     )
 
     assert callable(setup_earthdata_session)
@@ -34,14 +36,18 @@ def test_import_point_sampling():
 
 
 def test_find_sentinel2_tile():
-    """Test Sentinel-2 tile lookup for Los Angeles."""
+    """Test Sentinel-2 tile containment lookup and open-ocean None behavior."""
     from ECOv003_CMR import find_sentinel2_tile
 
     tile = find_sentinel2_tile(-118.2437, 34.0522)
     assert tile == "11SLT"
 
-    tile = find_sentinel2_tile(-118.4085, 33.9416)
-    assert tile == "11SLT"
+    all_tiles = find_sentinel2_tile(-118.2437, 34.0522, return_all=True)
+    assert "11SLT" in all_tiles
+
+    ocean_tile = find_sentinel2_tile(-140.0, 0.0)
+    assert ocean_tile is None
+    assert find_sentinel2_tile(-140.0, 0.0, return_all=True) == []
 
 
 def test_setup_earthdata_session_with_params():
@@ -51,7 +57,7 @@ def test_setup_earthdata_session_with_params():
     session = setup_earthdata_session(
         username="testuser",
         password="testpass",
-        require_auth=True
+        require_auth=True,
     )
 
     assert session.auth == ("testuser", "testpass")
@@ -83,7 +89,7 @@ def test_sample_points_from_geodataframe_validation():
 
     data = {
         'datetime': [datetime(2025, 6, 15)],
-        'geometry': [Point(-118.24, 34.05)]
+        'geometry': [Point(-118.24, 34.05)],
     }
     gdf = gpd.GeoDataFrame(data)
 
@@ -97,7 +103,7 @@ def test_sample_points_from_geodataframe_missing_columns():
 
     data = {
         'site_id': ['A'],
-        'geometry': [Point(-118.24, 34.05)]
+        'geometry': [Point(-118.24, 34.05)],
     }
     gdf = gpd.GeoDataFrame(data, crs='EPSG:4326')
 
@@ -111,7 +117,7 @@ def test_sample_points_from_geodataframe_crs_reprojection():
 
     data = {
         'datetime': [datetime(2025, 6, 15)],
-        'geometry': [Point(-13163264, 4035122)]
+        'geometry': [Point(-13163264, 4035122)],
     }
     gdf = gpd.GeoDataFrame(data, crs='EPSG:3857')
 
@@ -196,28 +202,43 @@ def test_sample_point_from_url_reads_values_and_nan_nodata():
     assert reason == "nodata"
 
 
-def test_sample_points_from_geodataframe_converts_collection3_lst_to_celsius(monkeypatch):
-    import importlib
-
+def test_sample_points_from_geodataframe_joins_stars_and_converts_lst_to_celsius(monkeypatch):
     point_sampling = importlib.import_module("ECOv003_CMR.point_sampling")
-    granule = "ECOv003_L2T_LSTE_44814_001_52NHN_20260601T000306_02"
-    search_results = pd.DataFrame(
-        [{
-            "type": "GeoTIFF Data",
-            "variable": "LST",
-            "granule": granule,
-            "URL": "https://example.test/lst.tif",
-            "orbit": 44814,
-            "scene": 1,
-        }]
-    )
+    lste_granule = "ECOv003_L2T_LSTE_44814_001_52NHN_20260601T000306_02"
+    stars_granule = "ECOv003_L2T_STARS_52NHN_20260601_01"
+
+    def mock_search(product, tile, **kwargs):
+        if product == "L2T_LSTE":
+            return pd.DataFrame([
+                {
+                    "type": "GeoTIFF Data",
+                    "variable": "LST",
+                    "granule": lste_granule,
+                    "URL": "https://example.test/lst.tif",
+                    "orbit": 44814,
+                    "scene": 1,
+                }
+            ])
+        if product == "L2T_STARS":
+            return pd.DataFrame([
+                {
+                    "type": "GeoTIFF Data",
+                    "variable": "NDVI",
+                    "granule": stars_granule,
+                    "URL": "https://example.test/ndvi.tif",
+                    "orbit": None,
+                    "scene": None,
+                }
+            ])
+        return pd.DataFrame()
+
+    def mock_sample_var(variable, url, lons, lats, session, use_vsicurl, stream_semaphore=None):
+        val = 300.0 if variable == "LST" else 0.55
+        return variable, [val for _ in lons]
+
     monkeypatch.setattr(point_sampling, "find_sentinel2_tile", lambda lon, lat: "52NHN")
-    monkeypatch.setattr(point_sampling, "ECOSTRESS_CMR_search", lambda **kwargs: search_results)
-    monkeypatch.setattr(
-        point_sampling,
-        "sample_point_from_url",
-        lambda *args, **kwargs: (300.0, {"nodata": None}),
-    )
+    monkeypatch.setattr(point_sampling, "ECOSTRESS_CMR_search", mock_search)
+    monkeypatch.setattr(point_sampling, "_sample_single_variable_url", mock_sample_var)
 
     gdf = gpd.GeoDataFrame(
         {"datetime": [datetime(2026, 6, 1)], "geometry": [Point(-118.24, 34.05)]},
@@ -225,19 +246,19 @@ def test_sample_points_from_geodataframe_converts_collection3_lst_to_celsius(mon
     )
     results = point_sampling.sample_points_from_geodataframe(
         geometry=gdf,
-        layers=["ST_C", "LST"],
+        layers=["ST_C", "LST", "NDVI"],
         session=Mock(),
         verbose=False,
     )
 
+    assert len(results) == 1
     assert results.loc[0, "LST"] == pytest.approx(300.0)
     assert results.loc[0, "ST_C"] == pytest.approx(26.85)
+    assert results.loc[0, "NDVI"] == pytest.approx(0.55)
 
 
 @pytest.mark.parametrize("max_workers", [1, 2])
 def test_sample_points_over_date_range_supports_etaux_only(monkeypatch, max_workers):
-    import importlib
-
     point_sampling = importlib.import_module("ECOv003_CMR.point_sampling")
     granule = "ECOv003_L3T_ETAUX_44814_001_53NMH_20260601T000306_01"
     search_results = pd.DataFrame(
@@ -254,8 +275,8 @@ def test_sample_points_over_date_range_supports_etaux_only(monkeypatch, max_work
     monkeypatch.setattr(point_sampling, "ECOSTRESS_CMR_search", lambda **kwargs: search_results)
     monkeypatch.setattr(
         point_sampling,
-        "sample_point_from_url",
-        lambda *args, **kwargs: (21.5, {"nodata": None}),
+        "_sample_single_variable_url",
+        lambda variable, url, lons, lats, *args, **kwargs: (variable, [21.5 for _ in lons]),
     )
 
     results = point_sampling.sample_points_over_date_range(
@@ -274,9 +295,6 @@ def test_sample_points_over_date_range_supports_etaux_only(monkeypatch, max_work
 
 @pytest.mark.parametrize("max_workers", [1, 2])
 def test_sample_points_over_date_range_multi_point_stars_and_empty_tile(monkeypatch, max_workers):
-    """Ensure sequential (max_workers=1) and parallel paths sample all points even if the last point has no granules."""
-    import importlib
-
     point_sampling = importlib.import_module("ECOv003_CMR.point_sampling")
     stars_granule = "ECOv003_L2T_STARS_11SLT_20260601_01"
 
@@ -297,8 +315,8 @@ def test_sample_points_over_date_range_multi_point_stars_and_empty_tile(monkeypa
     monkeypatch.setattr(point_sampling, "ECOSTRESS_CMR_search", mock_search)
     monkeypatch.setattr(
         point_sampling,
-        "sample_point_from_url",
-        lambda *args, **kwargs: (0.42, {"nodata": None}),
+        "_sample_single_variable_url",
+        lambda variable, url, lons, lats, *args, **kwargs: (variable, [0.42 for _ in lons]),
     )
 
     gdf = gpd.GeoDataFrame(
@@ -326,3 +344,18 @@ def test_sample_points_over_date_range_multi_point_stars_and_empty_tile(monkeypa
 
     assert sorted(results["site_id"].tolist()) == ["site_a", "site_b"]
     assert np.allclose(results["NDVI"], 0.42)
+
+
+def test_summarize_point_samples_from_parquet_files(tmp_path):
+    from ECOv003_CMR.point_sampling import summarize_point_samples
+
+    p1 = tmp_path / "part_1.parquet"
+    p2 = tmp_path / "part_2.parquet"
+    pd.DataFrame({"ST_C": [25.0, np.nan], "NDVI": [0.4, 0.5]}).to_parquet(p1, index=False)
+    pd.DataFrame({"ST_C": [27.0, 28.0], "NDVI": [np.nan, 0.6]}).to_parquet(p2, index=False)
+
+    summary = summarize_point_samples([p1, p2], layers=["ST_C", "NDVI"]).set_index("layer")
+    assert summary.loc["ST_C", "total_rows"] == 4
+    assert summary.loc["ST_C", "valid_count"] == 3
+    assert summary.loc["ST_C", "completeness_pct"] == 75.0
+    assert summary.loc["NDVI", "valid_count"] == 3

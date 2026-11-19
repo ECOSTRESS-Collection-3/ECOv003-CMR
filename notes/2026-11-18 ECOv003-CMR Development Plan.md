@@ -2,24 +2,17 @@
 
 **Prepared:** 2026-11-18  
 **Repository:** `ECOSTRESS-Collection-3/ECOv003-CMR`  
-**Previous Version:** `v1.1.1`  
-**Current Version:** `v1.2.0` (Implemented & Benchmarked on `point_query`)  
-**Next Target Version:** `v1.3.0` (Large-Volume Scaling, Correctness Hardening & API Refinements)  
+**Previous Versions:** `v1.1.1` (Collection 3 Baseline), `v1.2.0` (Concurrent `/vsicurl/` Stratified Sampler)  
+**Current Version:** `v1.3.0` (Implemented & Benchmarked: Large-Volume Scaling, Correctness Hardening & API Refinements)  
 **Future Target Version:** `v1.4.0` (On-Demand Land-Cover & Cropland Stratification)
 
 ---
 
 ## 1. Executive Summary
 
-`ECOv003-CMR` provides programmatic access to NASA's Common Metadata Repository (CMR) and LP DAAC Earthdata Cloud (`LPCLOUD`) archives for ECOSTRESS Collection 3 (`.003`). Through `v1.1.1`, the package established complete Collection 3 product support, authenticated granule downloads, `ECOv003-granules` compatibility, CLI tooling (`ECOv003-search`, `ECOv003-download`), and site-centric Cloud-Optimized GeoTIFF (COG) point sampling.
+`ECOv003-CMR` provides programmatic access to NASA's Common Metadata Repository (CMR) and LP DAAC Earthdata Cloud (`LPCLOUD`) archives for ECOSTRESS Collection 3 (`.003`). Across `v1.1.1` through `v1.3.0`, the package evolved from a site-centric download and point-query library into a production-hardened, globally scalable, spatially and seasonally stratified point-sampling engine (`build_stratified_dataset()`), originally motivated by generating a **~1,000,000-sample non-tower ECOSTRESS training dataset** for uncertainty quantification (UQ) via transport maps, spatial downscaling of relative humidity (`RH`), and temporal upscaling of evapotranspiration (`ET`).
 
-In **`v1.2.0`**, `ECOv003-CMR` has been extended into a **general-purpose, granule-centric, spatially and seasonally stratified point-sampling engine** (`build_stratified_dataset()`), originally motivated by generating a **~1,000,000-sample non-tower ECOSTRESS training dataset** for uncertainty quantification (UQ) via transport maps, spatial downscaling of relative humidity (`RH`), and temporal upscaling of evapotranspiration (`ET`).
-
-Through empirical profiling and iterative architectural optimization against live LP DAAC Earthdata Cloud granules, per-granule extraction latency across 16 science/UQ layers was reduced from **56.71s** to **13.00s** ($4.4\times$ speedup), bringing the amortized global 1,000,000-sample runtime down from **3.98 hours** to **56.77 minutes** on 16 workers with **100.0% layer completeness**.
-
-For **`v1.3.0`**, development focuses on **scaling the point sampler for large-volume, multi-million-sample production campaigns and hardening multi-product correctness**—specifically eliminating NASA CMR per-tile query bottlenecks, caching candidate granule catalogs with schema validation, bounding concurrent LP DAAC CloudFront/S3 HTTP streams, exporting Netscape URS cookies across multi-hour runs, adding adaptive per-granule quota refills with pixel deduplication, upgrading site-centric queries to `/vsicurl/`, and resolving remaining codebase edge cases.
-
-For **`v1.4.0`**, development will introduce **on-demand land-cover and cropland stratification** (`ECOv003_CMR/land_cover.py`) with tile-level raster caching and global agricultural vs. natural ecosystem quota tracking.
+Through three major releases and live benchmarking against LP DAAC Earthdata Cloud granules (`11SLT`, June 1–7, 2026 across 16 science and UQ layers), **mean per-granule extraction latency was reduced from 56.71s (`v1.2.0` baseline) to 13.00s (`v1.2.0` concurrent) and down to 9.76s (`v1.3.0`)—an overall $5.8\times$ per-granule speedup**—reducing the amortized global 1,000,000-sample runtime estimate from **3.98 hours** to **45.44 minutes** on 16 workers with **100.0% layer completeness** (`57 passed` offline unit tests + live `make test-sampler` verification).
 
 ---
 
@@ -58,166 +51,109 @@ The baseline architecture in `v1.1.1` was built across six foundational engineer
 
 ---
 
-## 3. Architectural Evolution: `v1.1.1` $\rightarrow$ `v1.2.0`
+## 3. Architectural Evolution: `v1.1.1` $\rightarrow$ `v1.2.0` $\rightarrow$ `v1.3.0`
 
-| Pipeline Stage | `v1.1.1` Behavior | `v1.2.0` Implemented Architecture |
-| :--- | :--- | :--- |
-| **API Generalization** | Site-centric point queries only. | General-purpose stratified sampling engine (`build_stratified_dataset()` in `stratified_dataset_builder.py`) with `DEFAULT_STRATIFIED_LAYERS` and optional `UQ_LAYERS` preset. |
-| **Spatial Discovery** | Required user-supplied `tile` IDs or point coordinates. | `list_ecostress_land_tiles()` (`tile_catalog.py`) enumerates all global land-intersecting Sentinel-2 MGRS tiles within ECOSTRESS orbital coverage ($\pm 54^\circ$ latitude) using cached Natural Earth landmass polygons. |
-| **CMR Query Footprint** | Queried a single point at tile centroid (`lon,lat,lon,lat`), missing partial-tile diagonal swaths. | Queries full tile WGS84 bounding boxes (`geometry.bounds`, `use_tile_bounds=True`) with exact `_<TILE>_` granule filtering, HTTP `429`/`503` exponential backoff, and `cloud_cover` metadata extraction. |
-| **Clear-Sky Filtering** | Returned all matching CMR assets regardless of cloud cover or product completeness. | `find_clear_sky_et_granules()` verifies daytime clear-sky `L3T_JET` overpasses with matching `(orbit, scene, tile, timestamp)` `L2T_LSTE` and `L3T_ETAUX` granules plus same-date `(tile, YYYYMMDD)` `L2T_STARS` granules, caching all variable URLs in memory. |
-| **Stratified Selection** | Sampled fixed user coordinates across every overpass in a date window. | `select_stratified_granules()` caps per-tile counts at $N_{\text{cap}} = \min_{t \in \text{Eligible}} N_t$ (subject to `min_granules_floor`), balances calendar quarters, and computes per-granule quota $K = \lceil N_{\text{target}} / G \rceil$. |
-| **Intra-Granule Sampling** | No dynamic intra-scene coordinate generation or land-cover balancing. | `extract_valid_swath_mask()` + `sample_granule_coordinates()` independently randomize $K$ valid clear-sky land pixels per scene ("rolling the dice") with `"stratified_grid"` or `"uniform"` dispersion and optional cropland weighting. |
-| **Cross-Product Join** | Indexed `L3T_*` granules by `YYYYMMDD`, overwriting multiple overpasses on the same day. | Joins instantaneous products (`L2T_LSTE`, `L3T_ETAUX`, `L3T_JET`, `L4T_*`) by `(orbit, scene, tile, timestamp)` and daily `L2T_STARS` by `(tile, YYYYMMDD)`. |
-| **COG Read Architecture** | Downloaded full compressed `.tif` into `MemoryFile` per `(point, granule, variable)`. | `sample_points_from_granule()` opens all requested variable COGs **concurrently** (`ThreadPoolExecutor`) over authenticated `/vsicurl/` HTTP byte-range requests and extracts all $K$ coordinates via vectorized `src.sample(proj_coords, masked=True)`. |
-| **Variable Coverage** | 16 layers across `L2T_LSTE`, `L2T_STARS`, and `L3T_ETAUX`. | 46 mapped layers in `LAYER_MAPPING`, adding verified `L3T_JET` ET & partitioning (`PTJPLSMinst`, `ETdaily`, `ETuncertainty`, `PTJPLSMcanopy`, `STICJPLdaily`, `BESSJPLdaily`, `PMJPLdaily`), `L2T_STARS` UQ (`NDVI-UQ`, `albedo-UQ`), `L2T_LSTE` spectral emissivities/angles, and `L4T_ESI`/`L4T_WUE`. |
-| **Output & Checkpointing** | Returned an in-memory `pandas.DataFrame` only after completion. | Streams partitioned Parquet/CSV batches (`dataset_part_XXXX.parquet`) to disk with a `completed_granules.txt` manifest, `summarize_point_samples()` diagnostics, and automated 1M runtime extrapolation. |
-
----
-
-## 4. Empirical Engineering & Optimization Process (`v1.2.0`)
-
-During development and live testing (`make test-sampler` on Sentinel-2 tile `11SLT`, June 1–7, 2026 across 16 layers), the pipeline underwent three empirical engineering iterations:
-
-### Iteration 1: General-Purpose API Refactoring & Instrumentation
-- **Observation:** While the initial scientific driver was generating a 1,000,000-sample UQ dataset, the underlying spatial/seasonal stratification and `/vsicurl/` batch sampling mechanics are domain-agnostic.
-- **Action:** Renamed `uq_dataset_builder.py` $\rightarrow$ `stratified_dataset_builder.py` and `build_uq_training_dataset()` $\rightarrow$ `build_stratified_dataset()`, preserving `UQ_LAYERS` as a convenience layer list. Added `time.perf_counter()` instrumentation per stage and a `make test-sampler` target.
-
-### Iteration 2: Baseline `/vsicurl/` Benchmark (Sequential Layer Reads)
-- **Measurement (`11SLT`, 2 granules, $K=13$, 16 layers, `max_workers=2`):**
-  - Total wall time: **65.78s** (`2.42s` CMR search, `4.01s` cookie pre-warmup, `59.26s` COG extraction, `0.09s` Parquet aggregation).
-  - Mean per-granule latency: **56.71s / granule**.
-  - Amortized global 1,000,000-sample estimate ($4{,}000$ granules, $K=250$, 16 workers): **3.98 hours** (naive linear scaling at $K=13$: `26.38 days`).
-- **Bottleneck Diagnosis:**
-  1. Each granule worker re-queried `ECOSTRESS_CMR_search` (`~2s` per granule) even though Stage 3 (`find_clear_sky_et_granules`) had already retrieved all `.tif` URLs.
-  2. Each granule worker opened `L3T_ETAUX` `cloud` and `water` COGs separately (`~6s`) before opening the 16 science layers.
-  3. Inside `sample_points_from_granule()`, all 16 remote GeoTIFF URLs were opened **sequentially** (`16 × ~3s ≈ 48s` of serial HTTP redirect/header latency).
-
-### Iteration 3: Three Targeted Throughput Optimizations
-- **Optimization 1 — Pre-Fetched Stage 3 URL Caching:** Updated `find_clear_sky_et_granules()` to merge and attach `variable_urls` directly onto each verified granule metadata row, eliminating all per-granule CMR API queries during extraction.
-- **Optimization 2 — Single-Pass Pre-Masked Swath Discovery:** Updated `extract_valid_swath_mask()` to accept `primary_data_url` (using `L3T_JET` `PTJPLSMinst`, which is already cloud- and water-masked), eliminating 2 separate mask COG opens per granule.
-- **Optimization 3 — Concurrent Intra-Granule COG Layer Reads:** Refactored `sample_points_from_granule()` to open and sample all 16 requested GeoTIFF layers concurrently via `ThreadPoolExecutor(max_workers=8)`.
-
-### Empirical Benchmark Comparison (`11SLT`, 2 Granules, 16 Layers)
-
-| Benchmark Metric | Baseline `v1.2.0` (Sequential Layers) | Optimized `v1.2.0` (Concurrent + Cached URLs) | Improvement |
+| Pipeline Stage | `v1.1.1` Baseline | `v1.2.0` Stratified Sampler | `v1.3.0` Production Hardening & Scale |
 | :--- | :--- | :--- | :--- |
-| **Total Wall Time (2 granules)** | `65.78s` | **`19.77s`** | **$3.3\times$ faster** |
-| **CMR Granule Search** | `2.42s` (plus `~2s`/granule re-queries) | **`2.61s`** (one-time; `0.00s` per granule) | **Eliminated re-queries** |
-| **COG Extraction Wall Time** | `59.26s` | **`13.27s`** | **$4.5\times$ faster** |
-| **Mean Granule Latency** | `56.71s / granule` | **`13.00s / granule`** | **$4.4\times$ faster** |
-| **Small-Batch Throughput ($K=13$)** | `0.44 samples/s` | **`1.96 samples/s`** | **$4.5\times$ faster** |
-| **Layer Completeness (16 layers)** | `100.0%` (`26/26` valid) | **`100.0%`** (`26/26` valid) | **Zero data loss** |
-| **1M Global Estimate (Amortized)** | `3.98 hours` | **`56.77 minutes`** | **$4.2\times$ faster** |
+| **Spatial Discovery** | Required user-supplied `tile` IDs or point coordinates (`sentinel_tiles.nearest()`). | `list_ecostress_land_tiles()` enumerates global land tiles within $\pm 54^\circ$ latitude. | `find_sentinel2_tile()` uses true polygon intersection (`sentinel_tiles.tiles(point)`) with `sentinel_tiles.land(t)` filtering (returning `None` over open ocean and supporting `return_all=True`). |
+| **CMR Query Footprint & Scale** | Queried single tile centroid (`lon,lat,lon,lat`), missing diagonal swaths. | Queried full tile bounds (`use_tile_bounds=True`), but issued `4 × N_tiles` per-tile requests globally. | Clusters `len(tiles) > 25` into $30^\circ \times 30^\circ$ WGS84 regional boxes (`sentinel_tiles.footprint(tile).bounds`) and 92-day temporal chunks (`>100×` fewer CMR calls); strips URS Basic Auth when querying `cmr.earthdata.nasa.gov`. |
+| **Catalog Persistence** | Re-queried CMR on every run. | In-memory URL caching within a single run only. | Persists `candidate_granules.parquet` with SHA-256 cache-key validation (`catalog_path`, `refresh_catalog`) for `<1s` offline restarts. |
+| **Intra-Granule Sampling & Quotas** | Fixed user coordinates across overpasses. | Dynamic `"stratified_grid"` / `"uniform"` coordinate randomization with fixed `1.25×` oversample. | Bounded adaptive quota refill (`max_refill_attempts = 2`) with coordinate deduplication when multi-product `NaN` dropouts cause shortfalls, plus `"stratified_grid"` dispersion parity when `cropland_mask` is supplied. |
+| **COG Read & Concurrency** | Downloaded full `.tif` into `MemoryFile` per `(point, granule, variable)`. | Concurrent `/vsicurl/` reads in `sample_points_from_granule()` (unbounded nested pools); site queries still used full-file `MemoryFile` downloads. | Shared `threading.Semaphore(max_concurrent_streams)` bounding active HTTP streams, deterministic GDAL HTTP retries (`429,502,503,504`), and unified granule-grouped `/vsicurl/` sampling across `sample_points_over_date_range()` and `sample_points_from_geodataframe()`. |
+| **Auth & Cookie Lifecycle** | One-time `mkstemp` cookie file without Netscape serialization or cleanup. | Pre-warmed `requests.Session` once at start of run. | `@contextmanager` `configure_gdal_earthdata_env()` exports `session.cookies` via `http.cookiejar.MozillaCookieJar`, refreshes cookies across synchronous `batch_size` windows, and removes temp files on exit. |
+| **Diagnostics & Memory** | In-memory `DataFrame` only. | Partitioned Parquet writes, but `pd.concat` loaded all rows into RAM at Stage 6. | Constant-RAM ($O(1)$) streaming `pyarrow.parquet.ParquetFile` column metadata/batch diagnostics in `summarize_point_samples()`. |
 
 ---
 
-## 5. Observed & Theoretical Capabilities of `v1.2.0`
+## 4. Implemented `v1.3.0` Workstreams
 
-### 5.1 Observed Capabilities (Verified via `make test` & `make test-sampler`)
-- **Automated Test Suite:** 52 offline unit tests passing across Python 3.11–3.14 (`make test` in `3.25s`), plus gated live NASA CMR integration tests (`pytest -m integration`).
-- **Authenticated `/vsicurl/` Byte-Range Extraction:** Process-wide `rasterio.Env` with URS cookie pre-warming avoids S3 presigned redirect header conflicts and reads arbitrary subsets of COGs directly from `LPCLOUD`.
-- **Per-Granule Latency:** **~13.0s per granule** across 16 variables spanning 4 distinct ECOSTRESS products (`L2T_LSTE`, `L2T_STARS`, `L3T_ETAUX`, `L3T_JET`), including full-resolution ($3660 \times 3660$) swath mask evaluation (~730k–1.0M valid land pixels per scene) and `stratified_grid` coordinate randomization.
-- **Fault-Tolerant Checkpointing:** Incremental Parquet/CSV partition writes (`dataset_part_XXXX.parquet`) and `completed_granules.txt` manifest tracking verified across multi-worker runs.
-
-### 5.2 Theoretical Scaling & Production Envelope (1,000,000-Sample Campaign)
-Because GDAL `/vsicurl/` fetches compressed $512 \times 512$ internal GeoTIFF tiles via HTTP byte-range requests, opening a remote COG and sampling $K=250$ points incurs virtually the same network latency (`~13s` per granule) as sampling $K=13$ points:
-
-| Scale Regime | Granules ($G$) | Quota / Granule ($K$) | Concurrency | Theoretical Throughput | Estimated Wall Time |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Single-Tile Smoke Test** (`11SLT`, 1 wk) | `2` | `13` | `2` workers | `~1.96 samples/s` | **`~20 seconds`** *(observed)* |
-| **Regional Campaign** (e.g., CONUS / Western US, ~150 tiles) | `~1,200` | `834` | `16` workers | `~1,025 samples/s` | **`~16–20 minutes`** |
-| **Global Mission Campaign** ($\pm 54^\circ$ land tiles, $N_{\text{cap}} \approx 4\text{–}8$) | `~4,000` | `250` | `16` workers | `~308 samples/s` | **`~57 minutes`** |
-| **Global High-Concurrency Cloud Run** (AWS `us-west-2` EC2/batch) | `~4,000` | `250` | `32` workers | `~615+ samples/s` | **`~20–30 minutes`** |
-
-*(Note: Running inside AWS `us-west-2`—the same region hosting NASA LP DAAC `LPCLOUD` S3 buckets—reduces per-COG HTTP round-trip latency from ~120ms to <10ms, further accelerating `/vsicurl/` extraction by $2\times\text{–}3\times$.)*
-
----
-
-## 6. Completed `v1.2.0` Checklist
-
-- [x] **Global MGRS Tile Catalog (`ECOv003_CMR/tile_catalog.py`):** Implemented `list_ecostress_land_tiles(min_lat=-54.0, max_lat=54.0)` with cached Natural Earth landmass geometry.
-- [x] **Full-Bounds CMR Queries & Backoff (`ECOSTRESS_CMR_search_links.py`, `ECOSTRESS_CMR_search.py`, `interpret_ECOSTRESS_URLs.py`):** Enabled WGS84 tile bounding-box queries (`use_tile_bounds=True`), exact `_<TILE>_` filtering, HTTP `429`/`503` backoff, `cloud_cover` metadata propagation, and `fetch_granule_metadata()`.
-- [x] **Stratified Granule & Pixel Selection (`ECOv003_CMR/stratified_sampling.py`):** Implemented `find_clear_sky_et_granules()` (with URL caching), `select_stratified_granules()`, `compute_per_granule_quota()`, `extract_valid_swath_mask()` (with `primary_data_url`), and `sample_granule_coordinates()` (`"stratified_grid"`, `"uniform"`, and cropland weighting).
-- [x] **Concurrent `/vsicurl/` Batch Sampler & Expanded Layers (`ECOv003_CMR/point_sampling.py`):** Added 46 mapped layers across all Collection 3 products, fixed same-day multi-overpass joining, implemented concurrent `sample_points_from_granule()`, and added `summarize_point_samples()`.
-- [x] **General Stratified Dataset Builder & Benchmarks (`ECOv003_CMR/stratified_dataset_builder.py`):** Implemented `build_stratified_dataset()` with Parquet/CSV checkpointing, `completed_granules.txt` manifest resuming, stage timings, and 1M runtime extrapolation.
-- [x] **Packaging, Tests & Documentation:** Bumped `pyproject.toml` to `1.2.0` with `pyarrow`, added `tests/test_stratified_sampling.py` and `tests/test_live_integration.py`, added `make test-sampler`, and updated `README.md` and `examples/stratified_sampling_demo.py`.
+1. **Regional Bounding-Box & Temporal-Chunked CMR Discovery (`ECOv003_CMR/stratified_sampling.py`, `ECOSTRESS_CMR_search.py`, `ECOSTRESS_CMR_search_links.py`):**
+   - Automatically clusters tile sets exceeding `regional_batch_threshold=25` into $30^\circ \times 30^\circ$ WGS84 regional bounding boxes and 92-day temporal chunks (`page_size=2000`), filtering entries locally against `allowed_tiles`.
+   - Threads `session` for HTTP keep-alive connection pooling while ensuring URS Basic Auth headers are never sent to public `cmr.earthdata.nasa.gov` search endpoints.
+   - Logs and rejects unparseable asset URLs during tile filtering instead of silently passing them.
+2. **Persistent Candidate Granule Catalog Caching (`ECOv003_CMR/stratified_dataset_builder.py`):**
+   - Saves verified multi-product candidate catalogs to `candidate_granules.parquet` with JSON-serialized `variable_urls` and Parquet schema metadata encoding `(start_date, end_date, max_cloud_cover, tile_count, tiles_sha256, queried_products)`.
+   - Reloads matching catalogs offline when `refresh_catalog=False`, and automatically re-queries if requested layers require uncached products.
+3. **Bounded HTTP Stream Concurrency & Deterministic Retry Backoff (`ECOv003_CMR/stratified_dataset_builder.py`, `point_sampling.py`, `authentication.py`):**
+   - Decouples outer `max_workers` from inner `layer_workers` and enforces a global `threading.Semaphore(max_concurrent_streams)` (default `32`) across all `/vsicurl/` reads.
+   - Configures deterministic GDAL HTTP retry options (`GDAL_HTTP_MAX_RETRY=3`, `GDAL_HTTP_RETRY_DELAY=2`, `GDAL_HTTP_RETRY_CODES=429,502,503,504`) alongside jittered exponential backoff on `MemoryFile` fallbacks.
+4. **Netscape URS Cookie Export, Synchronous Batch Re-Warming & Cleanup (`ECOv003_CMR/authentication.py`, `stratified_dataset_builder.py`):**
+   - Converts `configure_gdal_earthdata_env()` into a `@contextmanager` that serializes pre-warmed `session.cookies` into Netscape format (`http.cookiejar.MozillaCookieJar`) for GDAL `libcurl` and deletes temporary `earthdata_gdal_*.cookies` files in `finally`.
+   - Partitions pending granules into synchronous `batch_size` windows (default `250`) to refresh cookies cleanly between batches.
+5. **Constant-RAM Streaming Parquet Diagnostics (`ECOv003_CMR/point_sampling.py`, `stratified_dataset_builder.py`):**
+   - Extends `summarize_point_samples()` to accept Parquet file paths and compute per-layer valid/missing counts directly from `pyarrow.parquet.ParquetFile` row-group statistics (falling back to streaming `iter_batches()` when stats are absent).
+6. **Adaptive Per-Granule Quota Refill & Cropland Dispersion Parity (`ECOv003_CMR/stratified_dataset_builder.py`, `stratified_sampling.py`):**
+   - Adds a bounded adaptive refill loop (`max_refill_attempts = 2`) in `_process_granule()` with coordinate deduplication (`seen_coords`) so multi-product `NaN` dropouts do not cause silent sample shortfalls.
+   - Routes user-supplied `cropland_mask` sampling in `sample_granule_coordinates()` through `_draw_dispersed_indices()` so `"stratified_grid"` dispersion applies equally to agricultural and natural land pools.
+7. **Granule-Grouped `/vsicurl/` Site Queries & True MGRS Containment (`ECOv003_CMR/point_sampling.py`):**
+   - Refactors `sample_points_over_date_range()` and `sample_points_from_geodataframe()` onto `_build_granule_sampling_batches()` and `sample_points_from_granule()` (`/vsicurl/`), joining daily `L2T_STARS` priors by `(tile, YYYYMMDD)` and eliminating redundant per-point full-file `MemoryFile` downloads.
+   - Updates `find_sentinel2_tile()` to use `sentinel_tiles.tiles(Point(lon, lat))` with `sentinel_tiles.land(t)` filtering (`land_only=True`, `return_all=False`).
+8. **Code Hygiene & Deprecation Warnings (`granule_ID.py`, `download_ECOSTRESS_granule*.py`, `version.py`):**
+   - Consolidates duplicate `product_name_from_granule_ID()` into `product_name_from_filename()`.
+   - Emits `DeprecationWarning` when the legacy misspelled `aquisition_date` argument is passed.
+   - Wraps `importlib.metadata.version("ECOv003-CMR")` in `version.py` with a `PackageNotFoundError` fallback reading `pyproject.toml`.
 
 ---
 
-## 7. Roadmap for `v1.3.0`: Large-Volume Scaling, Correctness Hardening, and API Refinements
+## 5. Technical Challenges Encountered & How They Were Overcome
 
-To support multi-million-sample global campaigns reliably without triggering upstream NASA CMR rate limits, CloudFront connection throttling, or session expiration—while resolving multi-product sampling edge cases and technical debt—`v1.3.0` consolidates eight workstreams (implemented using existing package dependencies with zero new external runtime requirements):
+During live integration and unit testing of `v1.3.0` against `sentinel-tiles` (`1.2.0`), NASA CMR (`cmr.earthdata.nasa.gov`), and LP DAAC Earthdata Cloud (`LPCLOUD`), four concrete technical challenges surfaced and were resolved:
 
-### 7.1 Regional Bounding-Box & Temporal-Chunked CMR Discovery (`ECOv003_CMR/stratified_sampling.py`, `ECOSTRESS_CMR_search.py`, `ECOSTRESS_CMR_search_links.py`)
-- **Problem:** Global MGRS discovery (`list_ecostress_land_tiles()`) returns ~14,000 land tiles; querying `4 products × 14,000 tiles` issues ~56,000 sequential CMR requests, triggering HTTP `429`/`503` throttling and adding hours of search overhead. Additionally, `find_clear_sky_et_granules()` accepts `session` without passing it to `ECOSTRESS_CMR_search()`, and `ECOSTRESS_CMR_search_links.py` uses a bare `except Exception: pass` when filtering granule tile IDs.
-- **A Priori Technical Design:**
-  - Automatically cluster large tile sets (`len(tiles) > 25`) into regional WGS84 bounding boxes (e.g., $30^\circ \times 30^\circ$ or continental regions) and issue bulk `ECOSTRESS_CMR_search_entries(bounding_box=...)` queries partitioned into bounded quarterly/semi-annual temporal windows (`page_size=2000`) so dense continental boxes stay well below CMR's 1,000,000-hit deep-paging cap and request timeout limits.
-  - Filter returned entries locally against `set(tiles)`, reducing global CMR API calls by $>100\times$ (from ~56,000 down to ~300–500 requests).
-  - Thread `session: Optional[requests.Session] = None` through `find_clear_sky_et_granules()` $\rightarrow$ `ECOSTRESS_CMR_search()` $\rightarrow$ `ECOSTRESS_CMR_search_links()` / `ECOSTRESS_CMR_search_entries()` for HTTP keep-alive connection pooling.
-  - Tighten exception handling around `granule_ID_from_filename(href)` in `ECOSTRESS_CMR_search_links.py` so unparseable URLs are logged and rejected rather than silently accepted.
+1. **NASA CMR Rejecting Earthdata URS Basic Auth Headers (`401 Unauthorized`):**
+   - *Challenge:* Threading the authenticated `requests.Session` (configured with `session.auth = (username, password)` for `urs.earthdata.nasa.gov`) into `ECOSTRESS_CMR_search_links()` caused `cmr.earthdata.nasa.gov/search/granules.json` to return `401 Client Error: Unauthorized`, because CMR search endpoints reject URS Basic Auth credentials.
+   - *Resolution:* Updated `_request_with_backoff()` in `ECOSTRESS_CMR_search_links.py` to bypass `session` when `session.auth` is set (`requests.get(...)`), reserving URS Basic Auth strictly for Earthdata Login / LP DAAC data endpoints.
+2. **`sentinel_tiles.grid(tile)` Returning `RasterGrid` Instead of a Shapely Polygon:**
+   - *Challenge:* `sentinel_tiles.grid(tile)` returns a `rasters.RasterGrid` object (which lacks `.bounds` and `.intersects()`), causing regional bounding-box clustering (`_cluster_tiles_to_regional_boxes`) to raise `AttributeError` and tile-bounds CMR queries to fall back to single centroid points (`lon,lat,lon,lat`).
+   - *Resolution:* Switched bounding-box resolution in `ECOSTRESS_CMR_search_links.py` and `stratified_sampling.py` to `sentinel_tiles.footprint(tile).bounds` (which returns the exact WGS84 tile polygon bounds), restoring full-tile swath discovery.
+3. **Open-Ocean MGRS Tile False Positives in `find_sentinel2_tile()`:**
+   - *Challenge:* `sentinel_tiles.tiles(Point(-140.0, 0.0))` returned `'07MFV'` because the global MGRS polygon index tiles both land and open ocean.
+   - *Resolution:* Added `land_only: bool = True` to `find_sentinel2_tile()` in `point_sampling.py`, filtering `sentinel_tiles.tiles(point)` through `sentinel_tiles.land(t)` so open-ocean coordinates cleanly return `None` (or `[]` when `return_all=True`).
+4. **Netscape Cookie Serialization for GDAL `/vsicurl/`:**
+   - *Challenge:* Pre-warming an Earthdata URL in `requests.Session` stores session tokens in an in-memory `RequestsCookieJar`, whereas GDAL's underlying `libcurl` requires a Netscape-formatted cookie file on disk (`GDAL_HTTP_COOKIEFILE`) to avoid per-thread OAuth redirect loops.
+   - *Resolution:* Implemented `_export_session_cookies_to_netscape()` using `http.cookiejar.MozillaCookieJar(cookie_file).save(...)` inside `configure_gdal_earthdata_env()` and removed the temporary cookie file in a `finally` block upon context exit.
 
-### 7.2 Persistent Candidate Granule Catalog Caching (`ECOv003_CMR/stratified_dataset_builder.py`)
-- **Problem:** Tuning `target_total_samples`, `min_granules_floor`, or `dispersion_strategy` across large geographic domains currently requires re-querying CMR from scratch.
-- **A Priori Technical Design:**
-  - Persist the verified multi-product candidate catalog (`candidate_granules.parquet`, serializing `variable_urls` dicts to JSON strings) inside `output_dir` (or a user-specified `catalog_path`).
-  - Store a cache key in Parquet schema metadata (or a lightweight JSON sidecar) capturing `(start_date, end_date, max_cloud_cover, required_products, tiles_hash)`.
-  - Support `refresh_catalog: bool = False`: if `refresh_catalog=False` and the cache key matches, reload offline in $<1\text{s}$; if a subsequent run requests new layers requiring uncached products (e.g., adding `L4T_ESI`), automatically query only the missing products and merge their URLs into the cached catalog.
+---
 
-### 7.3 Bounded HTTP Stream Concurrency & Deterministic Retry Backoff (`ECOv003_CMR/stratified_dataset_builder.py` & `point_sampling.py`)
-- **Problem:** Nested thread pools (`max_workers` outer granule workers $\times$ `max_workers` inner layer workers) can spawn $>100$ concurrent HTTPS connections, risking LP DAAC CloudFront per-IP burst throttling (`429`/`503`) and OS file-descriptor exhaustion (`ulimit -n`). Additionally, combining Python-level retry loops with GDAL's internal retries can amplify wait times (`GDAL retries × Python retries`).
-- **A Priori Technical Design:**
-  - Add explicit `layer_workers` and `max_concurrent_streams` (defaulting to `32–48` total active HTTP streams) using a shared `threading.Semaphore` across `_sample_single_variable_url()` calls.
-  - Configure GDAL's internal HTTP retry behavior deterministically inside `configure_gdal_earthdata_env()` (`GDAL_HTTP_MAX_RETRY=3`, `GDAL_HTTP_RETRY_DELAY=2`, `GDAL_HTTP_RETRY_CODES=429,502,503,504`) and apply jittered exponential backoff on `MemoryFile` fallback reads.
+## 6. Quantified Performance Progression (`v1.2.0` $\rightarrow$ `v1.3.0`)
 
-### 7.4 Netscape URS Cookie Persistence, Refresh & Temp File Cleanup (`ECOv003_CMR/authentication.py` & `stratified_dataset_builder.py`)
-- **Problem:** Earthdata URS session cookies and redirected AWS S3 presigned URLs expire after ~15–60 minutes during multi-hour global extractions. Furthermore, `configure_gdal_earthdata_env()` currently warms up `session.get(warmup_url)` in Python memory while pointing `GDAL_HTTP_COOKIEFILE` at an empty `mkstemp` file (which GDAL's `libcurl` cannot read unless formatted as a Netscape cookie jar) and leaves temporary `earthdata_gdal_*.cookies` files on disk after exit.
-- **A Priori Technical Design:**
-  - Wrap `configure_gdal_earthdata_env()` as a `@contextmanager` that removes temporary cookie files in a `finally` block on exit.
-  - During `warmup_url` pre-warming, export `session.cookies` into standard Netscape format via `http.cookiejar.MozillaCookieJar(cookie_file).save(ignore_discard=True, ignore_expires=True)` so GDAL's first `/vsicurl/` byte-range request reuses the authenticated URS session immediately without triggering per-thread OAuth redirects.
-  - Partition `pending` granules into bounded execution windows (`batch_size: int = 250`, ~50,000–62,500 samples per batch) and re-enter a fresh `configure_gdal_earthdata_env()` context strictly **between** synchronous batch boundaries after all worker futures in the active batch have joined (avoiding concurrent mutation of process-global `CPLSetConfigOption` state).
+Live benchmarks were executed via `make test-sampler` (`examples/stratified_sampling_demo.py`) on Sentinel-2 tile `11SLT` (June 1–7, 2026; 2 clear-sky overpasses, 16 science & UQ layers across `L2T_LSTE`, `L2T_STARS`, `L3T_ETAUX`, and `L3T_JET`, `max_workers=2`, `max_concurrent_streams=32`):
 
-### 7.5 Streaming Parquet Aggregation & Constant-RAM Diagnostics (`ECOv003_CMR/stratified_dataset_builder.py` & `point_sampling.py`)
-- **Problem:** Reading all partitioned Parquet files into a single `pd.DataFrame` via `pd.concat` at the end of a run scales linearly in RAM for multi-million-sample (10M+) datasets.
-- **A Priori Technical Design:**
-  - Compute `summarize_point_samples()` incrementally using `pyarrow.parquet.ParquetFile` column metadata (`num_rows` and per-column `statistics.null_count`, with a streaming `iter_batches()` fallback when statistics are absent) so peak memory usage remains constant ($<200\text{ MB}$) regardless of whether the dataset contains 1M or 50M rows.
+| Benchmark Metric | `v1.2.0` Baseline (Sequential Layers) | `v1.2.0` Optimized (Concurrent Layers) | `v1.3.0` Production (Netscape Cookies + Semaphore + Streaming Parquet) | Total Improvement (`v1.2.0` Base $\rightarrow$ `v1.3.0`) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Total Wall Time (2 granules)** | `65.78s` | `19.77s` | **`18.97s`** | **$3.47\times$ faster** (`-71.2%`) |
+| **COG Extraction Wall Time** | `59.26s` | `13.27s` | **`11.00s`** | **$5.39\times$ faster** (`-81.4%`) |
+| **Cookie Pre-Warmup Time** | `4.01s` | `3.89s` | **`3.19s`** (Netscape jar export) | **`-20.4%`** |
+| **Parquet Aggregation Time** | `0.09s` (`pd.concat`) | `0.09s` (`pd.concat`) | **`0.00s`** (`pyarrow` metadata) | **$O(1)$ RAM, `<1ms`** |
+| **Mean Per-Granule Latency** | `56.71s / granule` | `13.00s / granule` | **`9.76s / granule`** | **$5.81\times$ faster** (`-82.8%`) |
+| **Small-Batch Throughput ($K=13$)** | `0.44 samples/s` | `1.96 samples/s` | **`2.36 samples/s`** | **$5.36\times$ faster** (`+436%`) |
+| **Naive Linear 1M Estimate ($K=13$)** | `26.38 days` | `5.90 days` | **`4.90 days`** | **$5.38\times$ faster** |
+| **Amortized Global 1M Estimate ($4{,}000$ granules, $K=250$, 16 workers)** | `3.98 hours` | `56.77 minutes` | **`45.44 minutes`** | **$5.26\times$ faster** (`-81.0%`) |
+| **Layer Completeness (16 layers)** | `100.0%` (`26/26`) | `100.0%` (`26/26`) | **`100.0%` (`26/26`)** | **Zero data loss** |
+| **Offline Unit Test Suite** | `52 passed` | `52 passed` | **`57 passed`** (`2.77s`) | **`+5` new regression tests** |
 
-### 7.6 Adaptive Per-Granule Quota Refill with Pixel Deduplication & Cropland Dispersion Fix (`ECOv003_CMR/stratified_dataset_builder.py` & `stratified_sampling.py`)
-- **Problem:** `_process_granule()` draws a fixed `1.25×` oversample from the coarse `overview_level=0` swath mask, then drops rows if **any** requested layer across 4 products is `NaN` without retrying—causing silent sample shortfalls when coarse overview smearing or multi-product QA/fill masks drop >20% of candidate points. Additionally, when a user supplies a `cropland_mask` to `sample_granule_coordinates()`, the current implementation draws uniformly and bypasses `"stratified_grid"` spatial dispersion.
-- **A Priori Technical Design:**
-  - Add a bounded adaptive refill loop (`max_refill_attempts = 2`) in `_process_granule()` that draws additional unvisited coordinates (scaling oversampling by empirical survival rate and deduplicating already-sampled pixel coordinates so failed `NaN` pixels are never re-picked) whenever `len(valid_df) < quota_k` and valid swath pixels remain, accepting a partial batch if a scene genuinely lacks sufficient clear multi-product pixels.
-  - Route user-supplied `cropland_mask` sampling in `sample_granule_coordinates()` through the `"stratified_grid"` round-robin block dispersion logic when `strategy="stratified_grid"`.
+---
 
-### 7.7 Granule-Grouped `/vsicurl/` Sampling & MGRS Containment for Site Queries (`ECOv003_CMR/point_sampling.py`)
-- **Problem:** `sample_points_over_date_range()` and `sample_points_from_geodataframe()` still download full GeoTIFFs into `MemoryFile` per `(point, granule, variable)`; `sample_points_from_geodataframe()` re-queries CMR per row and fails to join daily `L2T_STARS` granules by date; and `find_sentinel2_tile()` uses `sentinel_tiles.nearest()`, returning coastal tiles for open-ocean points and missing overlapping tiles along UTM zone boundaries.
-- **A Priori Technical Design:**
-  - Refactor `sample_points_over_date_range()` and `sample_points_from_geodataframe()` to share batch CMR searches, join instantaneous products by `(orbit, scene, tile, timestamp)` and daily `L2T_STARS` by `(tile, YYYYMMDD)`, and extract points via `sample_points_from_granule()` (`/vsicurl/`), updating existing `tests/test_point_sampling.py` mocks accordingly.
-  - Update `find_sentinel2_tile()` to check `sentinel_tiles.grid(tile).intersects(point)` instead of `nearest()`, preserving `Optional[str]` as the default return type (`return_all: bool = False`) for backward compatibility while returning `List[str]` of all overlapping tiles when `return_all=True`.
+## 7. Completed `v1.3.0` Checklist
 
-### 7.8 Code Hygiene & Deprecation Warnings (`granule_ID.py`, `download_ECOSTRESS_granule*.py`, `version.py`)
-- **A Priori Technical Design:**
-  - Consolidate duplicate `product_name_from_granule_ID()` in `granule_ID.py` into `product_name_from_filename()`.
-  - Emit `warnings.warn(..., DeprecationWarning)` when the legacy misspelled `aquisition_date` argument is passed in `download_ECOSTRESS_granule()` and `download_ECOSTRESS_granule_files()`.
-  - Wrap `importlib.metadata.version("ECOv003-CMR")` in `version.py` with a `PackageNotFoundError` fallback for uninstalled source checkouts.
-
-### 7.9 Recommended `v1.3.0` Implementation Sequence
-1. **Foundation & Hygiene (`§7.8`, `§7.4`, `§7.3`):** Update `version.py`, `granule_ID.py`, deprecation warnings, `@contextmanager` Netscape cookie-jar export in `authentication.py`, and `stream_semaphore` + GDAL HTTP retry options in `point_sampling.py`.
-2. **CMR Discovery & Catalog Caching (`§7.1`, `§7.2`):** Thread `session` through `ECOSTRESS_CMR_search()`, implement regional bounding-box + temporal-chunked discovery in `stratified_sampling.py`, and add schema-validated `candidate_granules.parquet` persistence in `stratified_dataset_builder.py`.
-3. **Builder Hardening & Streaming Diagnostics (`§7.5`, `§7.6`):** Add synchronous `batch_size` cookie re-warming, bounded adaptive quota refill with pixel deduplication, `cropland_mask` dispersion parity, and `pyarrow.parquet` metadata aggregation.
-4. **Site-Centric `/vsicurl/` Upgrade (`§7.7`):** Unify `sample_points_over_date_range()` and `sample_points_from_geodataframe()` onto `sample_points_from_granule()` and update `find_sentinel2_tile()` to use `intersects()` with `return_all: bool = False`.
+- [x] **Regional Bounding-Box & Temporal-Chunked CMR Discovery (`ECOv003_CMR/stratified_sampling.py`, `ECOSTRESS_CMR_search_links.py`):** Clustered `len(tiles) > 25` into $30^\circ \times 30^\circ$ WGS84 boxes using `sentinel_tiles.footprint(tile).bounds` and 92-day temporal chunks; bypassed Basic Auth on CMR search endpoints.
+- [x] **Persistent Candidate Catalog Caching (`ECOv003_CMR/stratified_dataset_builder.py`):** Added SHA-256 cache-keyed `candidate_granules.parquet` persistence with `catalog_path` and `refresh_catalog`.
+- [x] **Bounded Stream Concurrency & Deterministic Retries (`stratified_dataset_builder.py`, `point_sampling.py`, `authentication.py`):** Added `max_concurrent_streams` semaphore, `layer_workers`, GDAL HTTP retry options, and jittered fallback backoff.
+- [x] **Netscape Cookie Export & Synchronous Batch Re-Warming (`authentication.py`, `stratified_dataset_builder.py`):** Converted `configure_gdal_earthdata_env()` to a `@contextmanager` with `MozillaCookieJar` export, `batch_size` windows, and temp cookie cleanup.
+- [x] **Constant-RAM Streaming Parquet Diagnostics (`point_sampling.py`, `stratified_dataset_builder.py`):** Implemented $O(1)$-RAM `pyarrow.parquet` column metadata/batch summarization.
+- [x] **Adaptive Quota Refill & Cropland Dispersion Parity (`stratified_dataset_builder.py`, `stratified_sampling.py`):** Added bounded quota-refill retries with coordinate deduplication and unified `"stratified_grid"` dispersion for `cropland_mask`.
+- [x] **Granule-Grouped `/vsicurl/` Site Queries & Land-Tile Lookup (`point_sampling.py`):** Unified `sample_points_over_date_range()` and `sample_points_from_geodataframe()` onto `sample_points_from_granule()` and updated `find_sentinel2_tile()` to use `sentinel_tiles.tiles()` + `sentinel_tiles.land()`.
+- [x] **Code Hygiene, Tests & Documentation:** Consolidated `product_name_from_filename()`, added `DeprecationWarning` on `aquisition_date`, added `version.py` fallback, bumped `pyproject.toml` to `1.3.0`, updated `README.md`, and verified `57 passed` unit tests + live `make test-sampler`.
 
 ---
 
 ## 8. Roadmap for `v1.4.0`: On-Demand Land-Cover & Cropland Stratification
 
-To support global agricultural vs. non-managed ecosystem stratification without requiring users to manually download, mosaic, and reproject external land-cover rasters for thousands of Sentinel-2 tiles—while keeping `v1.3.0` lightweight and free of new external dependencies—`v1.4.0` introduces built-in land-cover stratification:
+To support global agricultural vs. non-managed ecosystem stratification without requiring users to manually download, mosaic, and reproject external land-cover rasters for thousands of Sentinel-2 tiles, `v1.4.0` introduces built-in land-cover stratification:
 
 ### 8.1 On-Demand Land-Cover Provider (`ECOv003_CMR/land_cover.py`)
-- **Target Implementation:**
-  - Create `ECOv003_CMR/land_cover.py` to fetch and warp external land-cover classifications (e.g., ESA WorldCover 10m COGs or MODIS MCD12Q1) on demand to match a target Sentinel-2 MGRS tile's grid and affine transform.
-  - Cache aligned tile-level binary cropland masks in `~/.cache/ECOv003_CMR/land_cover/` so each MGRS tile is downloaded and reprojected at most once across all ECOSTRESS overpasses.
+- Fetch and warp external land-cover classifications (e.g., ESA WorldCover 10m COGs or MODIS MCD12Q1) on demand to match a target Sentinel-2 MGRS tile's grid and affine transform.
+- Cache aligned tile-level binary cropland masks in `~/.cache/ECOv003_CMR/land_cover/` so each MGRS tile is downloaded and reprojected at most once across all ECOSTRESS overpasses.
 
 ### 8.2 Global & Batch-Level Cropland Quota Tracking (`ECOv003_CMR/stratified_dataset_builder.py` & `stratified_sampling.py`)
-- **Target Implementation:**
-  - Expose `cropland_fraction_target` and `land_cover_source` directly on `build_stratified_dataset()`.
-  - Track realized cropland vs. non-managed sample counts across execution batches so tiles with limited or zero cropland (e.g., boreal forest, desert, or alpine tiles) do not cause quota failures, and downstream agricultural tiles dynamically compensate to achieve the global target proportion.
+- Expose `cropland_fraction_target` and `land_cover_source` directly on `build_stratified_dataset()`.
+- Track realized cropland vs. non-managed sample counts across execution batches so tiles with limited or zero cropland (e.g., boreal forest, desert, or alpine tiles) do not cause quota failures, and downstream agricultural tiles dynamically compensate to achieve the global target proportion.

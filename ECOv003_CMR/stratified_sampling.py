@@ -1,6 +1,6 @@
+from datetime import date, timedelta
 import math
-from datetime import date
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -8,9 +8,12 @@ import rasterio
 from rasterio.crs import CRS
 from rasterio.warp import transform
 import requests
+from sentinel_tiles import sentinel_tiles
 
 from .ECOSTRESS_CMR_search import ECOSTRESS_CMR_search
-from .constants import CMR_SEARCH_URL
+from .ECOSTRESS_CMR_search_links import ECOSTRESS_CMR_search_entries
+from .constants import CMR_SEARCH_URL, CONCEPT_IDS
+from .interpret_ECOSTRESS_URLs import interpret_ECOSTRESS_URLs
 
 
 def _extract_granule_join_keys(granule: str) -> Tuple[str, Optional[int], Optional[int], str, str]:
@@ -22,6 +25,62 @@ def _extract_granule_join_keys(granule: str) -> Tuple[str, Optional[int], Option
     return product, int(parts[3]), int(parts[4]), parts[5], parts[6]
 
 
+def _tile_bounds_wgs84(tile: str) -> Tuple[float, float, float, float]:
+    """Return (minx, miny, maxx, maxy) WGS84 bounds for a Sentinel-2 MGRS tile."""
+    grid_obj = sentinel_tiles.grid(tile)
+    if hasattr(grid_obj, "boundary_latlon"):
+        return grid_obj.boundary_latlon.bounds
+    if hasattr(grid_obj, "bounds"):
+        return grid_obj.bounds
+    centroid = grid_obj.centroid_latlon
+    return (centroid.x - 0.5, centroid.y - 0.5, centroid.x + 0.5, centroid.y + 0.5)
+
+
+def _cluster_tiles_to_regional_boxes(
+    tiles: Sequence[str],
+    deg_step: float = 30.0,
+) -> List[Tuple[Tuple[float, float, float, float], Set[str]]]:
+    """
+    Group MGRS tiles into coarse WGS84 regional bounding boxes so global CMR
+    discovery issues hundreds of bulk regional queries instead of tens of thousands
+    of per-tile requests.
+    """
+    buckets: Dict[Tuple[int, int], List[Tuple[str, Tuple[float, float, float, float]]]] = {}
+    for tile in tiles:
+        minx, miny, maxx, maxy = _tile_bounds_wgs84(tile)
+        cx = 0.5 * (minx + maxx)
+        cy = 0.5 * (miny + maxy)
+        bx = int(math.floor((cx + 180.0) / deg_step))
+        by = int(math.floor((cy + 90.0) / deg_step))
+        buckets.setdefault((bx, by), []).append((tile, (minx, miny, maxx, maxy)))
+
+    regions: List[Tuple[Tuple[float, float, float, float], Set[str]]] = []
+    for items in buckets.values():
+        region_tiles = {t for t, _ in items}
+        minx = max(-180.0, min(b[0] for _, b in items))
+        miny = max(-90.0, min(b[1] for _, b in items))
+        maxx = min(180.0, max(b[2] for _, b in items))
+        maxy = min(90.0, max(b[3] for _, b in items))
+        regions.append(((minx, miny, maxx, maxy), region_tiles))
+    return regions
+
+
+def _iter_temporal_chunks(
+    start_date: Union[date, str],
+    end_date: Union[date, str],
+    chunk_days: int = 92,
+) -> List[Tuple[date, date]]:
+    s_date = pd.to_datetime(start_date).date()
+    e_date = pd.to_datetime(end_date).date()
+    chunks: List[Tuple[date, date]] = []
+    cursor = s_date
+    while cursor <= e_date:
+        chunk_end = min(e_date, cursor + timedelta(days=chunk_days - 1))
+        chunks.append((cursor, chunk_end))
+        cursor = chunk_end + timedelta(days=1)
+    return chunks
+
+
 def find_clear_sky_et_granules(
     tiles: List[str],
     start_date: Union[date, str],
@@ -30,24 +89,60 @@ def find_clear_sky_et_granules(
     extra_products: Optional[List[str]] = None,
     CMR_search_URL: str = CMR_SEARCH_URL,
     session: Optional[requests.Session] = None,
+    regional_batch_threshold: int = 25,
 ) -> pd.DataFrame:
     """
     Verify candidate daytime clear-sky L3T_JET overpasses that have matching
     (orbit, scene, tile, timestamp) L2T_LSTE and L3T_ETAUX granules plus a
     same-date (tile, YYYYMMDD) L2T_STARS granule, caching all variable GeoTIFF URLs.
+    Automatically switches to regional WGS84 bounding-box + temporal-chunked CMR
+    queries when len(tiles) > regional_batch_threshold.
     """
     required_products = ["L3T_JET", "L2T_LSTE", "L3T_ETAUX", "L2T_STARS"]
     if extra_products:
         required_products = list(dict.fromkeys(required_products + list(extra_products)))
 
-    listing = ECOSTRESS_CMR_search(
-        product=required_products,
-        tile=tiles,
-        start_date=start_date,
-        end_date=end_date,
-        max_cloud_cover=max_cloud_cover,
-        CMR_search_URL=CMR_search_URL,
-    )
+    unique_tiles = list(dict.fromkeys(tiles))
+    if not unique_tiles:
+        return pd.DataFrame()
+
+    if len(unique_tiles) <= regional_batch_threshold:
+        listing = ECOSTRESS_CMR_search(
+            product=required_products,
+            tile=unique_tiles,
+            start_date=start_date,
+            end_date=end_date,
+            max_cloud_cover=max_cloud_cover,
+            CMR_search_URL=CMR_search_URL,
+            session=session,
+        )
+    else:
+        regions = _cluster_tiles_to_regional_boxes(unique_tiles)
+        temporal_chunks = _iter_temporal_chunks(start_date, end_date, chunk_days=92)
+        frames: List[pd.DataFrame] = []
+        for prod in required_products:
+            concept_id = CONCEPT_IDS[prod]
+            for bbox, region_tiles in regions:
+                for c_start, c_end in temporal_chunks:
+                    entries = ECOSTRESS_CMR_search_entries(
+                        concept_ID=concept_id,
+                        bounding_box=bbox,
+                        start_date=c_start,
+                        end_date=c_end,
+                        max_cloud_cover=max_cloud_cover,
+                        allowed_tiles=region_tiles,
+                        CMR_search_URL=CMR_search_URL,
+                        session=session,
+                    )
+                    if entries:
+                        df_chunk = interpret_ECOSTRESS_URLs(
+                            URLs=[e["URL"] for e in entries],
+                            entry_metadata=entries,
+                        )
+                        if not df_chunk.empty:
+                            frames.append(df_chunk)
+        listing = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
     if listing.empty:
         return pd.DataFrame()
 
@@ -223,6 +318,48 @@ def extract_valid_swath_mask(
     return valid_mask, affine, crs
 
 
+def _draw_dispersed_indices(
+    candidate_indices: np.ndarray,
+    rows: np.ndarray,
+    cols: np.ndarray,
+    draw_count: int,
+    shape: Tuple[int, int],
+    strategy: str,
+    grid_divisions: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if draw_count <= 0 or len(candidate_indices) == 0:
+        return np.array([], dtype=int)
+    draw_count = min(draw_count, len(candidate_indices))
+    if strategy == "uniform":
+        return rng.choice(candidate_indices, size=draw_count, replace=False)
+
+    height, width = shape
+    block_h = max(1, math.ceil(height / grid_divisions))
+    block_w = max(1, math.ceil(width / grid_divisions))
+    sub_rows = rows[candidate_indices]
+    sub_cols = cols[candidate_indices]
+    block_ids = (sub_rows // block_h) * grid_divisions + (sub_cols // block_w)
+
+    block_pools: Dict[int, List[int]] = {}
+    for orig_idx, b_id in zip(candidate_indices, block_ids):
+        block_pools.setdefault(int(b_id), []).append(int(orig_idx))
+    for b_id in block_pools:
+        block_pools[b_id] = list(rng.permutation(block_pools[b_id]))
+
+    chosen_list: List[int] = []
+    blocks = list(rng.permutation(list(block_pools.keys())))
+    while len(chosen_list) < draw_count:
+        progressed = False
+        for b_id in blocks:
+            if block_pools[b_id] and len(chosen_list) < draw_count:
+                chosen_list.append(block_pools[b_id].pop())
+                progressed = True
+        if not progressed:
+            break
+    return np.array(chosen_list, dtype=int)
+
+
 def sample_granule_coordinates(
     granule_mask: np.ndarray,
     affine: rasterio.Affine,
@@ -264,42 +401,21 @@ def sample_granule_coordinates(
             elif len(nat_idx) - n_nat >= rem:
                 n_nat += rem
 
-        chosen_crop = (
-            rng.choice(crop_idx, size=n_crop, replace=False) if n_crop > 0 else np.array([], dtype=int)
+        chosen_crop = _draw_dispersed_indices(
+            crop_idx, valid_rows, valid_cols, n_crop, granule_mask.shape, strategy, grid_divisions, rng
         )
-        chosen_nat = (
-            rng.choice(nat_idx, size=n_nat, replace=False) if n_nat > 0 else np.array([], dtype=int)
+        chosen_nat = _draw_dispersed_indices(
+            nat_idx, valid_rows, valid_cols, n_nat, granule_mask.shape, strategy, grid_divisions, rng
         )
         chosen = np.concatenate([chosen_crop, chosen_nat])
         rng.shuffle(chosen)
         sel_rows, sel_cols = valid_rows[chosen], valid_cols[chosen]
-    elif strategy == "uniform":
-        chosen = rng.choice(total_valid, size=draw_count, replace=False)
-        sel_rows, sel_cols = valid_rows[chosen], valid_cols[chosen]
     else:
-        height, width = granule_mask.shape
-        block_h = max(1, math.ceil(height / grid_divisions))
-        block_w = max(1, math.ceil(width / grid_divisions))
-        block_ids = (valid_rows // block_h) * grid_divisions + (valid_cols // block_w)
-
-        block_pools: Dict[int, List[int]] = {}
-        for idx, b_id in enumerate(block_ids):
-            block_pools.setdefault(int(b_id), []).append(idx)
-        for b_id in block_pools:
-            block_pools[b_id] = list(rng.permutation(block_pools[b_id]))
-
-        chosen_list: List[int] = []
-        blocks = list(rng.permutation(list(block_pools.keys())))
-        while len(chosen_list) < draw_count:
-            progressed = False
-            for b_id in blocks:
-                if block_pools[b_id] and len(chosen_list) < draw_count:
-                    chosen_list.append(block_pools[b_id].pop())
-                    progressed = True
-            if not progressed:
-                break
-        chosen_arr = np.array(chosen_list, dtype=int)
-        sel_rows, sel_cols = valid_rows[chosen_arr], valid_cols[chosen_arr]
+        all_idx = np.arange(total_valid, dtype=int)
+        chosen = _draw_dispersed_indices(
+            all_idx, valid_rows, valid_cols, draw_count, granule_mask.shape, strategy, grid_divisions, rng
+        )
+        sel_rows, sel_cols = valid_rows[chosen], valid_cols[chosen]
 
     xs, ys = rasterio.transform.xy(affine, sel_rows, sel_cols, offset="center")
     lons, lats = transform(crs, CRS.from_epsg(4326), xs, ys)

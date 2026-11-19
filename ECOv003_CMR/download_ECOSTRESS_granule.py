@@ -1,6 +1,7 @@
 from typing import Optional, Union
 from datetime import date
 import posixpath
+import warnings
 import pandas as pd
 import requests
 
@@ -25,24 +26,16 @@ def download_ECOSTRESS_granule(
         aquisition_date: Union[date, str] = None) -> ECOSTRESSGranule:
     """
     Downloads an ECOSTRESS granule based on the provided parameters and returns the granule object.
-
-    Parameters:
-    - product (str): The product type to download.
-    - tile (str): The tile identifier.
-    - acquisition_date (Union[date, str], optional): The date of acquisition.
-    - orbit (int, optional): The orbit number. Defaults to None.
-    - scene (int, optional): The scene number. Defaults to None.
-    - parent_directory (str, optional): The directory to save the downloaded files. Defaults to DOWNLOAD_DIRECTORY.
-    - CMR_file_listing_df (pd.DataFrame, optional): DataFrame containing file listings from CMR. Defaults to None.
-    - CMR_search_URL (str, optional): The URL for CMR search. Defaults to CMR_SEARCH_URL.
-    - session (requests.Session, optional): Authenticated NASA Earthdata session. Defaults to None.
-    - aquisition_date (Union[date, str], optional): Deprecated spelling alias for acquisition_date.
-
-    Returns:
-    - ECOSTRESSGranule: The downloaded ECOSTRESS granule object.
     """
-    if acquisition_date is None:
-        acquisition_date = aquisition_date
+    if aquisition_date is not None:
+        warnings.warn(
+            "'aquisition_date' is deprecated and will be removed in a future release; "
+            "use 'acquisition_date' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if acquisition_date is None:
+            acquisition_date = aquisition_date
 
     directory = download_ECOSTRESS_granule_files(
         product=product,
@@ -53,7 +46,7 @@ def download_ECOSTRESS_granule(
         parent_directory=parent_directory,
         CMR_file_listing_df=CMR_file_listing_df,
         CMR_search_URL=CMR_search_URL,
-        session=session
+        session=session,
     )
 
     granule = open_ECOSTRESS_granule(directory)
