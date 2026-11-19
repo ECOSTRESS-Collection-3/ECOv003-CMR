@@ -1,24 +1,24 @@
-# ECOv003-CMR Development Plan: From Collection 3 Migration (`v1.1.1`) to Global 1M-Sample Stratified Point-Query Pipeline (`v1.2.0`, `v1.3.0`, `v1.3.1`, `v1.3.2` & `v1.4.0`)
+# ECOv003-CMR Development Plan: From Collection 3 Migration (`v1.1.1`) to Global 1M-Sample Stratified Point-Query Pipeline (`v1.2.0`, `v1.3.0`, `v1.3.1` & `v1.4.0`)
 
 **Prepared:** 2026-11-19  
 **Repository:** `ECOSTRESS-Collection-3/ECOv003-CMR`  
-**Previous Versions:** `v1.1.1` (Collection 3 Baseline), `v1.2.0` (Concurrent `/vsicurl/` Stratified Sampler), `v1.3.0` (Two-Pass ET-First CMR Discovery & Wildcard Batch Resolution), `v1.3.1` (CMR `granules.csv`, `POST` Wildcard Batches, Sidecar `QAPercentCloudCover` & `64`-Socket Pool Sizing)  
-**Current Version:** `v1.3.2` (Implemented & Verified: Pre-Flight Capacity & Biome Planner, Dry-Run Mode, Rejection-Aware Backfill & Tropical-Inclusive Pilot Verification)  
+**Previous Versions:** `v1.1.1` (Collection 3 Baseline), `v1.2.0` (Concurrent `/vsicurl/` Stratified Sampler), `v1.3.0` (Two-Pass ET-First CMR Discovery & Wildcard Batch Resolution)  
+**Current Version:** `v1.3.1` (Implemented & Verified: CMR `granules.csv` + 5-Day Windows, HTTP `POST` Wildcard Batches, Sidecar `QAPercentCloudCover` Filtering, `64`-Socket Pool Sizing, Pre-Flight Capacity & Biome Planner, Dry-Run Mode & Rejection-Aware Backfill)  
 **Future Target Version:** `v1.4.0` (On-Demand Land-Cover & Cropland Stratification)
 
 ---
 
 ## 1. Executive Summary
 
-`ECOv003-CMR` provides programmatic access to NASA's Common Metadata Repository (CMR) and LP DAAC Earthdata Cloud (`LPCLOUD`) archives for ECOSTRESS Collection 3 (`.003`). Across `v1.1.1` through `v1.3.2`, the package evolved from a site-centric download and point-query library into a production-hardened, globally scalable, spatially and seasonally stratified point-sampling engine (`build_stratified_dataset()`), motivated by generating a **~1,000,000-sample non-tower ECOSTRESS training dataset** across the full 1-year Collection 3 record (`2025-10-31` to `2026-10-31`) for uncertainty quantification (UQ) via transport maps, spatial downscaling of relative humidity (`RH`), and temporal upscaling of evapotranspiration (`ET`).
+`ECOv003-CMR` provides programmatic access to NASA's Common Metadata Repository (CMR) and LP DAAC Earthdata Cloud (`LPCLOUD`) archives for ECOSTRESS Collection 3 (`.003`). Across `v1.1.1` through `v1.3.1`, the package evolved from a site-centric download and point-query library into a production-hardened, globally scalable, spatially and seasonally stratified point-sampling engine (`build_stratified_dataset()`), motivated by generating a **~1,000,000-sample non-tower ECOSTRESS training dataset** across the full 1-year Collection 3 record (`2025-10-31` to `2026-10-31`) for uncertainty quantification (UQ) via transport maps, spatial downscaling of relative humidity (`RH`), and temporal upscaling of evapotranspiration (`ET`).
 
-Through live benchmarking against LP DAAC Earthdata Cloud granules (`11SLT` single-tile benchmark and the multi-region `one_hundred_dataset.py` scale example across 16 science and UQ layers), **mean per-granule extraction latency was reduced from 56.71s (`v1.2.0` baseline) to 13.00s (`v1.2.0` concurrent) and down to 8.72s–9.76s (`v1.3.0`–`v1.3.2`)—an overall $5.8\times$–$6.5\times$ per-granule speedup**—reducing the amortized global 1,000,000-sample runtime estimate from **3.98 hours** to **40.07–40.15 minutes** on 16 workers with **100.0% layer completeness** (`59 passed` offline unit tests + live `one_hundred_dataset.py` `--dry-run` / extraction and global `L3T_JET` cloud-cover census verification).
+Through live benchmarking against LP DAAC Earthdata Cloud granules (`11SLT` single-tile benchmark and the multi-region `one_hundred_dataset.py` scale example across 16 science and UQ layers), **mean per-granule extraction latency was reduced from 56.71s (`v1.2.0` baseline) to 13.00s (`v1.2.0` concurrent) and down to 8.72s–9.76s (`v1.3.0`–`v1.3.1`)—an overall $5.8\times$–$6.5\times$ per-granule speedup**—reducing the amortized global 1,000,000-sample runtime estimate from **3.98 hours** to **40.07–40.15 minutes** on 16 workers with **100.0% layer completeness** (`59 passed` offline unit tests + live `one_hundred_dataset.py` `--dry-run` / extraction and global `L3T_JET` cloud-cover census verification).
 
-In `v1.3.1` and `v1.3.2`, global discovery, cloud filtering, and pre-flight capacity planning were completed and verified:
+In `v1.3.1`, global discovery, cloud filtering, and a priori sampling design capabilities were completed and verified against the full 1-year global `L3T_JET` archive (**348,477** scenes):
 1. **CMR `granules.csv` + 5-Day Parallel Windows:** Replaced `granules.umm_json` (~8 MB/page with G-Ring polygons and `RelatedUrls`) with flat `granules.csv` (~35 KB/page, **~97% smaller**) across 5-day parallel windows (`chunk_days=5`, `max_workers=6` with jittered retry backoff), enumerating all **348,477** global `L3T_JET` scenes in **2m 01s–2m 09s** with zero spatial overlap duplicates.
 2. **HTTP `POST` Wildcard Pattern Batching:** Updated `search_granules_by_name_patterns()` to send `application/x-www-form-urlencoded` `POST` requests to `granules.json`, eliminating `414 Request-URI Too Large` errors on batches of 150 `readable_granule_name[]` wildcard patterns and resolving 14 batches in **4–5 seconds**.
 3. **Sidecar `QAPercentCloudCover` Filtering & `64`-Socket Pool Sizing:** Removed `cloud_cover=0,...` query parameters from CMR requests (where `CloudCover` is null on all Collection 3 granules), mounted `HTTPAdapter(pool_connections=64, pool_maxsize=64)` in `setup_earthdata_session()` to eliminate `urllib3` pool-full warnings under 32-thread concurrency, and implemented concurrent `.json` sidecar inspection (`fetch_granule_metadata()`, `ProductMetadata.QAPercentCloudCover`), establishing global `L3T_JET` cloud-cover distributions (**54.5%** $\le 20\%$, **41.4%** $\le 10\%$, **6.0%** $\le 0\%$).
-4. **Data-Driven Pre-Flight Capacity Planner, Dry-Run Mode & Rejection-Aware Backfill (`v1.3.2`):** Added `plan_stratified_sampling()`, `estimate_cloud_cover_distribution()`, `dry_run=True` on `build_stratified_dataset()` / `one_hundred_dataset.py` / `one_million_dataset.py`, empirical cloud-rejection backfill multipliers, and humid-tropical tile coverage (`20LLQ`) in the 100-observation scale pilot (`136/136` valid samples at `13.13 samples/s`).
+4. **A Priori Sampling Design, Dry-Run Mode & Rejection-Aware Backfill:** Added `plan_stratified_sampling()`, `estimate_cloud_cover_distribution()`, `dry_run=True` on `build_stratified_dataset()` / `one_hundred_dataset.py` / `one_million_dataset.py`, empirical cloud-rejection backfill multipliers, and humid-tropical tile coverage (`20LLQ`) in the 100-observation scale pilot (`136/136` valid samples at `13.13 samples/s`).
 
 ---
 
@@ -57,14 +57,14 @@ The baseline architecture in `v1.1.1` was built across six foundational engineer
 
 ---
 
-## 3. Architectural Evolution: `v1.1.1` $\rightarrow$ `v1.2.0` $\rightarrow$ `v1.3.0` $\rightarrow$ `v1.3.2`
+## 3. Architectural Evolution: `v1.1.1` $\rightarrow$ `v1.2.0` $\rightarrow$ `v1.3.0` $\rightarrow$ `v1.3.1`
 
-| Pipeline Stage | `v1.1.1` Baseline | `v1.2.0` Stratified Sampler | `v1.3.0`–`v1.3.2` Production Hardening & Scale |
+| Pipeline Stage | `v1.1.1` Baseline | `v1.2.0` Stratified Sampler | `v1.3.0`–`v1.3.1` Production Hardening & Scale |
 | :--- | :--- | :--- | :--- |
 | **Spatial Discovery** | Required user-supplied `tile` IDs or point coordinates (`sentinel_tiles.nearest()`). | `list_ecostress_land_tiles()` attempted nested MGRS loop (240s, 0 tiles on `sentinel-tiles` `1.2.0`). | Vectorized `sentinel_tiles.sentinel_polygons` lookup (`14,749` global land tiles in `0.62s`); `find_sentinel2_tile()` uses true polygon intersection (`sentinel_tiles.tiles(point)`) with `sentinel_tiles.land(t)` filtering. |
 | **CMR Query Strategy & Scale** | Queried single tile centroid (`lon,lat,lon,lat`), missing diagonal swaths. | Queried full tile bounds (`use_tile_bounds=True`), but issued `4 × N_tiles` sequential per-tile requests globally. | **CMR `granules.csv` + `POST` wildcard resolution:** Enumerates global `L3T_JET` overpasses via `granules.csv` across 5-day parallel windows (~97% smaller payloads, zero spatial-overlap duplicates), runs `plan_stratified_sampling()` / `select_stratified_granules()`, and resolves `.tif`/`.json` URLs via `POST` `readable_granule_name[]` wildcard batches strictly for selected granules. |
 | **Cloud Cover Filtering** | None (returned all scenes). | Passed `max_cloud_cover` against `granules.json` `cloud_cover` (null on Collection 3). | Removed `cloud_cover` query params from CMR requests; reads `ProductMetadata.QAPercentCloudCover` concurrently from per-granule `.json` sidecars (`fetch_granule_metadata()`) and backfills dropped tiles using empirical cloud-rejection multipliers. |
-| **Pre-Flight Capacity Planning** | None (required full extraction to measure yield). | Manual inspection of logs after discovery. | `plan_stratified_sampling()` forecasts eligible tiles, tropical/temperate/boreal biome counts, $N_{\text{cap}}$, $G$, $K$, and wall time in <1s; `dry_run=True` caches catalogs and exits cleanly before Stage `[5/6]`. |
+| **A Priori Sampling Design** | None (required full extraction to measure yield). | Manual inspection of logs after discovery. | `plan_stratified_sampling()` forecasts eligible tiles, tropical/temperate/boreal biome counts, $N_{\text{cap}}$, $G$, $K$, and wall time in <1s; `dry_run=True` caches catalogs and exits cleanly before Stage `[5/6]`. |
 | **Socket & Catalog Resilience** | Re-queried CMR on every run without socket timeouts. | In-memory URL caching within a single run only. | Strict `(15s, 90s)` `(connect, read)` socket timeouts, `64`-socket `HTTPAdapter` pooling, jittered exponential retry backoff on `Timeout`/`ConnectionError`/HTTP `429,500,502,503,504`, `tqdm` progress bars, and SHA-256 validated `candidate_granules.parquet`. |
 | **Intra-Granule Sampling & Quotas** | Fixed user coordinates across overpasses. | Dynamic `"stratified_grid"` / `"uniform"` coordinate randomization with fixed `1.25×` oversample. | Bounded adaptive quota refill (`max_refill_attempts = 2`) with coordinate deduplication when multi-product `NaN` dropouts cause shortfalls, plus `"stratified_grid"` dispersion parity when `cropland_mask` is supplied. |
 | **COG Read & Concurrency** | Downloaded full `.tif` into `MemoryFile` per `(point, granule, variable)`. | Concurrent `/vsicurl/` reads in `sample_points_from_granule()` (unbounded nested pools); site queries still used full-file `MemoryFile` downloads. | Shared `threading.Semaphore(max_concurrent_streams)` bounding active HTTP streams, deterministic GDAL HTTP retries (`429,502,503,504`), live `tqdm` extraction progress/throughput telemetry, and unified granule-grouped `/vsicurl/` site queries. |
@@ -73,7 +73,7 @@ The baseline architecture in `v1.1.1` was built across six foundational engineer
 
 ---
 
-## 4. Implemented `v1.3.0`–`v1.3.2` Workstreams
+## 4. Implemented `v1.3.0` & `v1.3.1` Workstreams
 
 1. **Vectorized Global MGRS Land-Tile Discovery (`ECOv003_CMR/tile_catalog.py`):**
    - Queries `sentinel_tiles.sentinel_polygons` directly (`Land == True` within `[-54.0, 54.0]` latitude), enumerating all **14,749** ECOSTRESS-covered land MGRS tiles in **0.62s** (replacing a 239.5s brute-force MGRS grid loop).
@@ -84,7 +84,7 @@ The baseline architecture in `v1.1.1` was built across six foundational engineer
 3. **Sidecar `QAPercentCloudCover` Filtering & Stratified Global Cloud Census (`ECOv003_CMR/stratified_sampling.py`, `count_L3T_JET_scenes_by_cloud_percent.py`):**
    - Removed `cloud_cover=0,...` query parameters from CMR requests after proving CMR leaves `CloudCover` null on all Collection 3 granules.
    - Added `filter_granules_by_sidecar_cloud_cover()` and `estimate_cloud_cover_distribution()` to fetch per-granule `.json` sidecars concurrently (`max_workers=32` via `fetch_granule_metadata()`) and report threshold pass rates, 95% confidence intervals, and latitude-band statistics (`count_L3T_JET_scenes_by_cloud_percent.py` completed in **190.96s** with zero connection pool warnings).
-4. **Pre-Flight Stratification Capacity Planner, Dry-Run Mode & Rejection-Aware Backfill (`ECOv003_CMR/stratified_sampling.py`, `stratified_dataset_builder.py`, `__init__.py`):**
+4. **A Priori Sampling Design Planner, Dry-Run Mode & Rejection-Aware Backfill (`ECOv003_CMR/stratified_sampling.py`, `stratified_dataset_builder.py`, `__init__.py`):**
    - Implemented `plan_stratified_sampling()` to evaluate candidate `min_granules_floor` thresholds offline in <1s, reporting eligible tiles, `tropical` / `temperate` / `boreal` biome counts, $N_{\text{cap}}$, selected granules $G$, per-granule pixel quota $K$, and estimated Stage `[5/6]` wall time.
    - Replaced the fixed `need * 3` Stage `[4/6]` backfill slice with `_backfill_multiplier_for_cloud_cover(max_cloud_cover)` (`4×` for $\ge 20\%$, `5×` for $10\%\text{–}20\%$, `12×` for $< 10\%$).
    - Added `dry_run: bool = False` to `build_stratified_dataset()`, `one_hundred_dataset.py`, and `one_million_dataset.py` to execute discovery, cache `candidate_granules.parquet`, print/save the `stratification_plan`, and exit before Stage `[5/6]`.
@@ -113,7 +113,7 @@ The baseline architecture in `v1.1.1` was built across six foundational engineer
 
 ## 5. Technical Challenges Encountered & How They Were Overcome
 
-During live integration, global 1-year discovery runs, and unit testing across `v1.3.0`–`v1.3.2`, eleven concrete technical challenges surfaced and were resolved:
+During live integration, global 1-year discovery runs, and unit testing across `v1.3.0` and `v1.3.1`, eleven concrete technical challenges surfaced and were resolved:
 
 1. **Redundant Spatial CMR Sweeps Across Nighttime & Non-ET Overpasses:**
    - *Challenge:* Running blind spatial bounding-box searches across all four products (`L3T_JET`, `L2T_LSTE`, `L3T_ETAUX`, `L2T_STARS`) downloaded ~80–85% irrelevant metadata (all nighttime `L2T_LSTE`/`L3T_ETAUX` scenes, failed-ET overpasses, and 365 daily `L2T_STARS` tiles/year) that were subsequently discarded during the inner join with `L3T_JET`, while large $30^\circ \times 30^\circ \times 92\text{-day}$ boxes hit deep `CMR-Search-After` pagination cursors.
@@ -151,13 +151,13 @@ During live integration, global 1-year discovery runs, and unit testing across `
 
 ---
 
-## 6. Quantified Performance & Global Archive Census (`v1.2.0` $\rightarrow$ `v1.3.2`)
+## 6. Quantified Performance & Global Archive Census (`v1.2.0` $\rightarrow$ `v1.3.1`)
 
 ### 6.1 Extraction & Discovery Benchmarks
 
 Live benchmarks were executed via `make test-sampler` (`examples/stratified_sampling_demo.py`, single tile `11SLT`, 2 granules), `python one_hundred_dataset.py` (multi-region 5-tile pilot across `11SLT`, `11SPS`, `52NHN`, `53NMH`, and humid-tropical `20LLQ`, June 1–30, 2026), and `python count_L3T_JET_scenes_by_cloud_percent.py` (`2025-10-31` to `2026-10-31`):
 
-| Benchmark Metric | `v1.2.0` Baseline (Sequential Layers) | `v1.2.0` Optimized (Concurrent Layers) | `v1.3.0` Single-Tile (`11SLT`, 2 granules) | `v1.3.1` / `v1.3.2` Multi-Region Scale Example (`one_hundred_dataset.py`) | Total Improvement (`v1.2.0` Base $\rightarrow$ `v1.3.2`) |
+| Benchmark Metric | `v1.2.0` Baseline (Sequential Layers) | `v1.2.0` Optimized (Concurrent Layers) | `v1.3.0` Single-Tile (`11SLT`, 2 granules) | `v1.3.1` Multi-Region Scale Example (`one_hundred_dataset.py`) | Total Improvement (`v1.2.0` Base $\rightarrow$ `v1.3.1`) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Global Land Tile Discovery** | `239.53s` (`0` tiles) | `239.53s` | **`0.62s` (`14,749` tiles)** | **`0.62s` (`14,749` tiles)** | **$386\times$ faster** (`-99.7%`) |
 | **Global 1-Year `L3T_JET` Catalog Enumeration (`348,477` scenes)** | N/A (per-tile spatial) | N/A | `~15m` (`umm_json` 31d) | **`121s–129s` (`granules.csv` 5d)** | **$7.0\times$ faster** (`-85.7%`) |
@@ -182,7 +182,7 @@ Measured via `count_L3T_JET_scenes_by_cloud_percent.py` (`granules.csv` full enu
 
 ---
 
-## 7. Completed `v1.3.0`, `v1.3.1` & `v1.3.2` Checklists
+## 7. Completed `v1.3.0` & `v1.3.1` Checklists
 
 ### Completed in `v1.3.0`
 - [x] **Vectorized Global MGRS Land-Tile Catalog (`ECOv003_CMR/tile_catalog.py`):** Discovered all 14,749 ECOSTRESS-covered land MGRS tiles in 0.62s via `sentinel_tiles.sentinel_polygons`.
@@ -194,18 +194,16 @@ Measured via `count_L3T_JET_scenes_by_cloud_percent.py` (`granules.csv` full enu
 - [x] **Granule-Grouped `/vsicurl/` Site Queries, Land-Tile Lookup & Paired `experimental_data/` Runners (`point_sampling.py`, `one_million_dataset.py`, `one_hundred_dataset.py`):** Unified `sample_points_over_date_range()` and `sample_points_from_geodataframe()` onto `sample_points_from_granule()`, updated `find_sentinel2_tile()` to use `sentinel_tiles.tiles()` + `sentinel_tiles.land()`, and validated `one_hundred_dataset.py` into `./experimental_data/`.
 - [x] **Code Hygiene, Tests & Documentation:** Consolidated `product_name_from_filename()`, added `DeprecationWarning` on `aquisition_date`, added `version.py` fallback, bumped `pyproject.toml` to `1.3.0`, and updated `README.md`.
 
-### Completed in `v1.3.1` (CMR `granules.csv`, `POST` Batches, Sidecar `QAPercentCloudCover` & `64`-Socket Pooling)
+### Completed in `v1.3.1` (CMR `granules.csv`, `POST` Batches, Sidecar `QAPercentCloudCover`, `64`-Socket Pooling & A Priori Sampling Design)
 - [x] **CMR `granules.csv` 5-Day Parallel Catalog Enumeration (`ECOv003_CMR/constants.py`, `ECOSTRESS_CMR_search_links.py`):** Added `CMR_CSV_SEARCH_URL` and `search_granule_catalog_csv()` using `granules.csv` across 5-day parallel windows (`chunk_days=5`, `max_workers=6` with jittered retry backoff), cutting payload transfer by ~97% and enumerating all **348,477** global `L3T_JET` scenes in **~2m 01s**.
 - [x] **HTTP `POST` Wildcard Pattern Batching (`ECOSTRESS_CMR_search_links.py`):** Updated `search_granules_by_name_patterns()` to send `application/x-www-form-urlencoded` `POST` requests to `granules.json`, eliminating `414 Request-URI Too Large` errors on 150-pattern batches.
 - [x] **Sidecar `QAPercentCloudCover` Filtering (`stratified_sampling.py`, `stratified_dataset_builder.py`):** Removed `cloud_cover` query params from CMR requests, implemented concurrent `.json` sidecar filtering (`filter_granules_by_sidecar_cloud_cover()` via `fetch_granule_metadata()`), and added automatic tile backfill in `build_stratified_dataset()`.
 - [x] **Connection Pool Sizing (`ECOv003_CMR/authentication.py`):** Mounted `HTTPAdapter(pool_connections=64, pool_maxsize=64)` in `setup_earthdata_session()`, eliminating `urllib3` `Connection pool is full` warnings under 32-thread concurrency.
 - [x] **Stratified Global Cloud-Cover Census (`count_L3T_JET_scenes_by_cloud_percent.py`):** Verified global `L3T_JET` cloud-cover distribution (**54.5%** $\le 20\%$, **41.4%** $\le 10\%$, **6.0%** $\le 0\%$) in **190.96s**.
-
-### Completed in `v1.3.2` (Data-Driven Pre-Flight Capacity Planner & Rejection-Aware Backfill)
-- [x] **Pre-Flight Stratification & Capacity Planner (`ECOv003_CMR/stratified_sampling.py`, `__init__.py`):** Implemented `plan_stratified_sampling()` to forecast eligible MGRS tile counts, `tropical`/`temperate`/`boreal` biome representation, $N_{\text{cap}}$, selected granules $G$, per-granule pixel quota $K$, and estimated wall time in <1s, plus reusable `estimate_cloud_cover_distribution()`.
+- [x] **A Priori Sampling Design Planner (`ECOv003_CMR/stratified_sampling.py`, `__init__.py`):** Implemented `plan_stratified_sampling()` to forecast eligible MGRS tile counts, `tropical`/`temperate`/`boreal` biome representation, $N_{\text{cap}}$, selected granules $G$, per-granule pixel quota $K$, and estimated wall time in <1s, plus reusable `estimate_cloud_cover_distribution()`.
 - [x] **Rejection-Rate-Aware Backfill Sizing & Dry-Run Mode (`ECOv003_CMR/stratified_dataset_builder.py`):** Added `_backfill_multiplier_for_cloud_cover()` (`4×` for $\ge 20\%$, `5×` for $10\%\text{–}20\%$, `12×` for $< 10\%$) and `dry_run: bool = False` in `build_stratified_dataset()`.
 - [x] **Scale Runner Enhancements (`one_hundred_dataset.py`, `one_million_dataset.py`, `count_L3T_JET_scenes_by_cloud_percent.py`):** Added `--dry-run`, humid-tropical tile `20LLQ` in the 100-observation pilot, auto-reuse of `./experimental_data/one_million_dataset/candidate_granules.parquet`, and updated 1M defaults (`--max-workers 12`, `--max-concurrent-streams 48`), verified with `59 passed` offline unit tests and live `136/136` extraction.
-- [ ] **Version Metadata Bump & Pre-Flight Global Dry Run:** Bump `pyproject.toml` and `ECOv003_CMR/version.py` to `1.3.2` and run `python one_million_dataset.py --dry-run` to inspect global biome counts prior to launching the 1M extraction.
+- [ ] **Version Metadata Bump & Pre-Flight Global Dry Run:** Bump `pyproject.toml` and `ECOv003_CMR/version.py` to `1.3.1` and run `python one_million_dataset.py --dry-run` to inspect global biome counts prior to launching the 1M extraction.
 
 ---
 

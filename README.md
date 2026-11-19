@@ -33,7 +33,7 @@ pip install ECOv003-CMR
 To install from source with development tools (`pytest`, `build`, `twine`, `jupyter`):
 
 ```bash
-git clone https://github.com/ECOSTRESS-Collection-3/ECOv003-CMR.git
+git clone [https://github.com/ECOSTRESS-Collection-3/ECOv003-CMR.git](https://github.com/ECOSTRESS-Collection-3/ECOv003-CMR.git)
 cd ECOv003-CMR
 pip install -e ".[dev]"
 ```
@@ -44,7 +44,7 @@ pip install -e ".[dev]"
 
 CMR metadata searches are public. Downloading granule files and sampling raster URLs require a NASA Earthdata Login account ([urs.earthdata.nasa.gov](https://urs.earthdata.nasa.gov/)) with LP DAAC applications authorized.
 
-`setup_earthdata_session()` resolves credentials in the following priority order:
+`setup_earthdata_session()` mounts a 64-socket HTTP connection pool (`pool_connections=64`, `pool_maxsize=64`) to support high-concurrency COG and sidecar reads cleanly, and resolves credentials in the following priority order:
 
 1. **Explicit arguments** passed to `setup_earthdata_session(username=..., password=...)`
 2. **Environment variables:**
@@ -208,9 +208,11 @@ print(summarize_point_samples(samples))
 
 ## Python API: Global & Regional Stratified Dataset Builder
 
-`build_stratified_dataset()` scales stratified point-sample dataset generation to global multi-million-sample campaigns (~9.8s per granule across 16 science/UQ layers; ~45 minutes amortized for 1,000,000 samples across 4,000 global granules on 16 workers) with:
-- **Regional Bounding-Box & Temporal-Chunked CMR Discovery:** Automatically clusters tile sets larger than `regional_batch_threshold=25` into $30^\circ \times 30^\circ$ WGS84 regional boxes and 92-day temporal chunks.
-- **Persistent Candidate Catalog Caching (`catalog_path`, `refresh_catalog`):** Stores SHA-256 cache-keyed `candidate_granules.parquet` catalogs for instant offline restarts.
+`build_stratified_dataset()` scales stratified point-sample dataset generation to global multi-million-sample campaigns (~8.7s–9.6s per granule across 16 science/UQ layers; ~40 minutes amortized for 1,000,000 samples across 4,000 global granules on 16 workers) with:
+- **CMR `granules.csv` Discovery & `POST` Wildcard Resolution:** Enumerates global `L3T_JET` catalogs across 5-day parallel windows (~97% smaller payloads than JSON/UMM-JSON, zero spatial-overlap duplicates) and resolves `.tif` and `.json` asset URLs lazily via `POST` `readable_granule_name[]` batches strictly for selected granules.
+- **Sidecar `QAPercentCloudCover` Filtering & Rejection-Aware Backfill:** Evaluates `max_cloud_cover` concurrently against per-granule `.json` metadata sidecars (`ProductMetadata.QAPercentCloudCover`) and automatically backfills dropped tiles using empirical cloud-rejection multipliers.
+- **A Priori Sampling Design & Dry-Run Mode (`plan_stratified_sampling()`, `estimate_cloud_cover_distribution()`, `dry_run=True`):** Forecasts eligible MGRS tile counts, latitudinal biome representation (`tropical`, `temperate`, `boreal`), effective $N_{\text{cap}}$, selected granules $G$, per-granule pixel quota $K$, and estimated wall time before reading COGs.
+- **Persistent Candidate Catalog Caching (`catalog_path`, `refresh_catalog`):** Stores SHA-256 cache-keyed `candidate_granules.parquet` catalogs for <0.1s offline restarts.
 - **Bounded HTTP Stream Concurrency (`max_concurrent_streams`, `layer_workers`):** Caps simultaneous `/vsicurl/` connections via a shared `threading.Semaphore`.
 - **Synchronous Batch Cookie Re-Warming (`batch_size`):** Refreshes Netscape URS cookies across synchronous granule batches and cleans up temporary cookie files on exit.
 - **Adaptive Per-Granule Quota Refills:** Re-draws unvisited clear-sky pixels when multi-product `NaN` dropouts reduce accepted samples below `quota_k`.
@@ -227,20 +229,22 @@ summary = build_stratified_dataset(
     output_dir="./stratified_dataset_output",
     start_date=date(2026, 6, 1),
     end_date=date(2026, 6, 30),
-    tiles=["11SLT", "11SPS", "52NHN"],  # Omit (tiles=None) to run across all global land tiles
+    tiles=["11SLT", "11SPS", "52NHN", "53NMH", "20LLQ"],  # Omit (tiles=None) for all global land tiles
     target_total_samples=1000,
-    min_granules_floor=1,
+    min_granules_floor=2,
     dispersion_strategy="stratified_grid",
-    max_workers=4,
+    max_workers=12,
     layer_workers=8,
-    max_concurrent_streams=32,
+    max_concurrent_streams=48,
     batch_size=250,
     refresh_catalog=False,
+    dry_run=False,
     layers=UQ_LAYERS,
     export_csv=True,
     session=session,
 )
 
+print(summary["stratification_plan"])
 print(summary["coverage_summary"])
 ```
 
@@ -260,6 +264,41 @@ print(find_sentinel2_tile(-118.2437, 34.0522, return_all=True))
 # Include ocean-only MGRS tiles if needed
 print(find_sentinel2_tile(-140.0, 0.0, land_only=False))  # '07MFV'
 ```
+
+---
+
+## Examples
+
+### Large-Scale Stratified Dataset Runners
+
+* **`one_hundred_dataset.py`:** Multi-biome 100-observation pilot across 5 Sentinel-2 MGRS tiles (`11SLT`, `11SPS`, `52NHN`, `53NMH`, and humid-tropical `20LLQ`), writing partitioned Parquet/CSV outputs and `dataset_summary.json` into `./experimental_data/one_hundred_dataset`:
+  ```bash
+  # Pre-flight capacity & biome plan dry run (no COG reads)
+  python one_hundred_dataset.py --dry-run
+
+  # Full 100-observation extraction (~14-35s end-to-end)
+  python one_hundred_dataset.py
+  ```
+* **`one_million_dataset.py`:** Global 1,000,000-observation stratified dataset generator across all 14,749 ECOSTRESS-covered land MGRS tiles (`2025-10-31` to `2026-10-31`), writing resumable checkpoints into `./experimental_data/one_million_dataset`:
+  ```bash
+  # Step 1: Pre-flight dry run (~2m) to cache candidate_granules.parquet and inspect capacity plan
+  python one_million_dataset.py --dry-run
+
+  # Step 2: Execute global 1M-sample extraction (resumable via completed_granules.txt)
+  python one_million_dataset.py
+  ```
+* **`count_L3T_JET_scenes_by_cloud_percent.py`:** Global `L3T_JET` archive cloud-cover census using CMR `granules.csv` and concurrent `.json` sidecar `QAPercentCloudCover` inspection:
+  ```bash
+  python count_L3T_JET_scenes_by_cloud_percent.py --sample-size 2000
+  ```
+
+### Additional Scripts in `examples/`
+
+* `examples/point_sampling_demo.py` — Single-coordinate `L2T_LSTE` + `L2T_STARS` sampling in Los Angeles
+* `examples/geodataframe_sampling_demo.py` — Multi-site `GeoDataFrame` date-range sampling
+* `examples/csv_to_geodataframe_demo.py` — Loading site coordinates from CSV and exporting enriched ECOSTRESS observations
+* `examples/download_granules_demo.py` — Downloading `L2T_LSTE` and `L2T_STARS` granules locally
+* `examples/stratified_sampling_demo.py` — Single-tile stratified sampling benchmark (`make test-sampler`)
 
 ---
 
