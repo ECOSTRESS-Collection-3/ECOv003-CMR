@@ -5,13 +5,15 @@ This module provides functions for setting up authenticated sessions and GDAL
 /vsicurl/ environments to access NASA Earthdata services.
 """
 
+from contextlib import contextmanager
+import http.cookiejar
+import logging
 import os
 from pathlib import Path
 import tempfile
-from typing import Optional
-import requests
+from typing import Iterator, Optional
 import rasterio
-import logging
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -70,22 +72,34 @@ def setup_earthdata_session(
     return session
 
 
+def _export_session_cookies_to_netscape(session: requests.Session, cookie_file: str) -> None:
+    """Persist requests.Session cookies into a Netscape-format cookie jar for GDAL/libcurl."""
+    jar = http.cookiejar.MozillaCookieJar(cookie_file)
+    for cookie in session.cookies:
+        jar.set_cookie(cookie)
+    jar.save(ignore_discard=True, ignore_expires=True)
+
+
+@contextmanager
 def configure_gdal_earthdata_env(
     session: Optional[requests.Session] = None,
     cookie_file: Optional[str] = None,
     warmup_url: Optional[str] = None,
-) -> rasterio.Env:
+) -> Iterator[rasterio.Env]:
     """
-    Create a process-wide rasterio.Env configured for authenticated /vsicurl/
-    HTTP byte-range requests against LP DAAC Earthdata Cloud COGs without
-    forwarding Authorization headers to AWS S3 presigned redirects.
+    Context manager providing a process-wide rasterio.Env configured for authenticated
+    /vsicurl/ HTTP byte-range requests against LP DAAC Earthdata Cloud COGs, exporting
+    pre-warmed URS cookies to Netscape format and cleaning up temporary cookie files
+    on exit.
     """
     if session is None:
         session = setup_earthdata_session(require_auth=False)
 
+    created_temp_cookie = False
     if cookie_file is None:
         fd, cookie_file = tempfile.mkstemp(prefix="earthdata_gdal_", suffix=".cookies")
         os.close(fd)
+        created_temp_cookie = True
 
     if warmup_url is not None:
         try:
@@ -94,15 +108,31 @@ def configure_gdal_earthdata_env(
         except Exception as exc:
             logger.warning(f"Earthdata cookie pre-warm failed: {exc}")
 
+    try:
+        _export_session_cookies_to_netscape(session, cookie_file)
+    except Exception as exc:
+        logger.debug(f"Could not export session cookies to Netscape jar: {exc}")
+
     gdal_options = {
         "GDAL_HTTP_NETRC": "YES",
         "GDAL_HTTP_COOKIEFILE": cookie_file,
         "GDAL_HTTP_COOKIEJAR": cookie_file,
         "GDAL_HTTP_UNSAFESSL": "NO",
+        "GDAL_HTTP_MAX_RETRY": "3",
+        "GDAL_HTTP_RETRY_DELAY": "2",
+        "GDAL_HTTP_RETRY_CODES": "429,502,503,504",
         "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
         "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.TIF",
         "CPL_VSIL_CURL_USE_HEAD": "NO",
         "VSI_CACHE": "TRUE",
         "VSI_CACHE_SIZE": "50000000",
     }
-    return rasterio.Env(**gdal_options)
+    try:
+        with rasterio.Env(**gdal_options) as env:
+            yield env
+    finally:
+        if created_temp_cookie and cookie_file and os.path.exists(cookie_file):
+            try:
+                os.remove(cookie_file)
+            except OSError:
+                pass

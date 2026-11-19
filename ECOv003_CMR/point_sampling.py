@@ -3,31 +3,30 @@ Point sampling from ECOSTRESS Collection 3 data.
 
 This module provides functions for sampling ECOSTRESS raster data at specific
 geographic points, supporting single-point queries, granule-grouped /vsicurl/
-COG batch reads, and GeoDataFrame workflows.
+COG batch reads, streaming Parquet diagnostics, and GeoDataFrame workflows.
 """
 
-from datetime import date, datetime, timedelta
-from typing import Optional, Union, List, Dict, Tuple, Any
-import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta
+import logging
+from pathlib import Path
+import random
+import threading
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-import pandas as pd
-import numpy as np
-try:
-    from tqdm import tqdm
-    HAS_TQDM = True
-except ImportError:
-    HAS_TQDM = False
-    tqdm = None
 import geopandas as gpd
-import requests
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
 import rasterio
-from rasterio.io import MemoryFile
-from rasterio.windows import Window
-from rasterio.warp import transform, transform_bounds
 from rasterio.crs import CRS
-from shapely.geometry import Point
+from rasterio.io import MemoryFile
+from rasterio.warp import transform, transform_bounds
+from rasterio.windows import Window
+import requests
 from sentinel_tiles import sentinel_tiles
+from shapely.geometry import Point
 
 from .ECOSTRESS_CMR_search import ECOSTRESS_CMR_search
 from .authentication import setup_earthdata_session
@@ -89,6 +88,7 @@ LAYER_MAPPING = {
 }
 
 DEFAULT_LAYERS = ['ST_C', 'NDVI', 'albedo']
+_TRANSIENT_HTTP_STATUS = {429, 502, 503, 504}
 
 
 def _validate_layers(layers: List[str]) -> None:
@@ -129,6 +129,65 @@ def _overpass_key(granule: str) -> Optional[Tuple[str, str, str, str]]:
     return None
 
 
+def _http_get_with_jittered_backoff(
+    session: requests.Session,
+    url: str,
+    timeout: int = 90,
+    max_retries: int = 4,
+    base_delay: float = 1.0,
+) -> requests.Response:
+    for attempt in range(max_retries):
+        try:
+            resp = session.get(url, allow_redirects=True, timeout=timeout)
+            status = getattr(resp, "status_code", 200)
+            if status in _TRANSIENT_HTTP_STATUS and attempt < max_retries - 1:
+                retry_after = resp.headers.get("Retry-After") if hasattr(resp, "headers") else None
+                delay = float(retry_after) if retry_after else (base_delay * (2 ** attempt) + random.uniform(0, 0.5))
+                time.sleep(delay)
+                continue
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.RequestException:
+            if attempt >= max_retries - 1:
+                raise
+            time.sleep(base_delay * (2 ** attempt) + random.uniform(0, 0.5))
+    raise RuntimeError(f"Failed to fetch {url} after {max_retries} retries")
+
+
+def _sample_from_dataset(
+    src: rasterio.DatasetReader,
+    lons: List[float],
+    lats: List[float],
+) -> List[Optional[float]]:
+    bounds_wgs84 = transform_bounds(
+        src.crs,
+        CRS.from_epsg(4326),
+        src.bounds.left,
+        src.bounds.bottom,
+        src.bounds.right,
+        src.bounds.top,
+    )
+    in_bounds_indices = [
+        i for i, (lon, lat) in enumerate(zip(lons, lats))
+        if bounds_wgs84[0] <= lon <= bounds_wgs84[2] and bounds_wgs84[1] <= lat <= bounds_wgs84[3]
+    ]
+    extracted: List[Optional[float]] = [None] * len(lons)
+    if not in_bounds_indices:
+        return extracted
+
+    sub_lons = [lons[i] for i in in_bounds_indices]
+    sub_lats = [lats[i] for i in in_bounds_indices]
+    xs, ys = transform(CRS.from_epsg(4326), src.crs, sub_lons, sub_lats)
+    sampled = list(src.sample(zip(xs, ys), masked=True))
+    for idx, val in zip(in_bounds_indices, sampled):
+        scalar = val[0]
+        if np.ma.is_masked(scalar) or np.isnan(float(scalar)):
+            extracted[idx] = None
+        else:
+            extracted[idx] = float(scalar)
+    return extracted
+
+
 def _sample_single_variable_url(
     variable: str,
     url: str,
@@ -136,34 +195,35 @@ def _sample_single_variable_url(
     lats: List[float],
     session: Optional[requests.Session],
     use_vsicurl: bool,
+    stream_semaphore: Optional[threading.Semaphore] = None,
 ) -> Tuple[str, List[Optional[float]]]:
     extracted: Optional[List[Optional[float]]] = None
-    if use_vsicurl:
-        try:
-            with rasterio.open(url) as src:
-                xs, ys = transform(CRS.from_epsg(4326), src.crs, lons, lats)
-                sampled = list(src.sample(zip(xs, ys), masked=True))
-                extracted = [
-                    None if np.ma.is_masked(val[0]) or np.isnan(float(val[0])) else float(val[0])
-                    for val in sampled
-                ]
-        except Exception as exc:
-            logger.debug(f"/vsicurl/ read failed for {url}, falling back to MemoryFile: {exc}")
 
-    if extracted is None:
-        if session is None:
-            session = setup_earthdata_session()
-        resp = session.get(url, allow_redirects=True, timeout=90)
-        resp.raise_for_status()
-        with MemoryFile(resp.content) as memfile, memfile.open() as src:
-            xs, ys = transform(CRS.from_epsg(4326), src.crs, lons, lats)
-            sampled = list(src.sample(zip(xs, ys), masked=True))
-            extracted = [
-                None if np.ma.is_masked(val[0]) or np.isnan(float(val[0])) else float(val[0])
-                for val in sampled
-            ]
+    def _run_read() -> Optional[List[Optional[float]]]:
+        nonlocal session
+        local_extracted: Optional[List[Optional[float]]] = None
+        if use_vsicurl:
+            try:
+                with rasterio.open(url) as src:
+                    local_extracted = _sample_from_dataset(src, lons, lats)
+            except Exception as exc:
+                logger.debug(f"/vsicurl/ read failed for {url}, falling back to MemoryFile: {exc}")
 
-    return variable, extracted
+        if local_extracted is None:
+            if session is None:
+                session = setup_earthdata_session()
+            resp = _http_get_with_jittered_backoff(session, url, timeout=90)
+            with MemoryFile(resp.content) as memfile, memfile.open() as src:
+                local_extracted = _sample_from_dataset(src, lons, lats)
+        return local_extracted
+
+    if stream_semaphore is not None:
+        with stream_semaphore:
+            extracted = _run_read()
+    else:
+        extracted = _run_read()
+
+    return variable, extracted if extracted is not None else [None] * len(lons)
 
 
 def sample_points_from_granule(
@@ -174,11 +234,12 @@ def sample_points_from_granule(
     use_vsicurl: bool = True,
     metadata_rows: Optional[List[Dict[str, Any]]] = None,
     max_workers: int = 8,
+    stream_semaphore: Optional[threading.Semaphore] = None,
 ) -> pd.DataFrame:
     """
-    Open each variable GeoTIFF once (concurrently across variables) and extract
-    all K coordinates in a single vectorized src.sample(proj_coords, masked=True)
-    call over /vsicurl/ (falling back to MemoryFile if needed).
+    Open each variable GeoTIFF once (concurrently across variables, optionally bounded
+    by stream_semaphore) and extract all K coordinates in a single vectorized
+    src.sample() call over /vsicurl/ (falling back to MemoryFile if needed).
     """
     if not coords:
         return pd.DataFrame()
@@ -206,7 +267,13 @@ def sample_points_from_granule(
             futures = [
                 executor.submit(
                     _sample_single_variable_url,
-                    var, variable_urls[var], lons, lats, session, use_vsicurl
+                    var,
+                    variable_urls[var],
+                    lons,
+                    lats,
+                    session,
+                    use_vsicurl,
+                    stream_semaphore,
                 )
                 for var in requested_vars
             ]
@@ -217,7 +284,13 @@ def sample_points_from_granule(
     else:
         for var in requested_vars:
             variable, extracted = _sample_single_variable_url(
-                var, variable_urls[var], lons, lats, session, use_vsicurl
+                var,
+                variable_urls[var],
+                lons,
+                lats,
+                session,
+                use_vsicurl,
+                stream_semaphore,
             )
             for i, val in enumerate(extracted):
                 records[i][variable] = val
@@ -227,22 +300,99 @@ def sample_points_from_granule(
 
 
 def summarize_point_samples(
-    results_df: pd.DataFrame, layers: Optional[List[str]] = None
+    results_or_paths: Union[pd.DataFrame, Sequence[Union[str, Path]]],
+    layers: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """Summarize valid observation counts and completeness percentages per layer."""
-    if layers is None:
-        layers = [col for col in results_df.columns if col in LAYER_MAPPING]
+    """
+    Summarize valid observation counts and completeness percentages per layer.
+    Accepts either an in-memory DataFrame or a sequence of Parquet file paths
+    (computed via pyarrow metadata/batches in O(1) memory).
+    """
+    if isinstance(results_or_paths, pd.DataFrame):
+        results_df = results_or_paths
+        if layers is None:
+            layers = [col for col in results_df.columns if col in LAYER_MAPPING]
 
-    total = len(results_df)
+        total = len(results_df)
+        summary_rows = []
+        for layer in layers:
+            valid = int(results_df[layer].notna().sum()) if layer in results_df.columns else 0
+            missing = total - valid
+            pct = (100.0 * valid / total) if total > 0 else 0.0
+            summary_rows.append(
+                {
+                    "layer": layer,
+                    "total_rows": total,
+                    "valid_count": valid,
+                    "missing_count": missing,
+                    "completeness_pct": round(pct, 2),
+                }
+            )
+        return pd.DataFrame(summary_rows)
+
+    parquet_paths = [Path(p) for p in results_or_paths if Path(p).exists()]
+    if not parquet_paths:
+        target_layers = layers or []
+        return pd.DataFrame(
+            [
+                {
+                    "layer": layer,
+                    "total_rows": 0,
+                    "valid_count": 0,
+                    "missing_count": 0,
+                    "completeness_pct": 0.0,
+                }
+                for layer in target_layers
+            ]
+        )
+
+    first_pf = pq.ParquetFile(parquet_paths[0])
+    schema_names = set(first_pf.schema_arrow.names)
+    if layers is None:
+        layers = [col for col in first_pf.schema_arrow.names if col in LAYER_MAPPING]
+
+    total_rows = 0
+    null_counts: Dict[str, int] = {layer: 0 for layer in layers}
+    missing_cols = {layer for layer in layers if layer not in schema_names}
+
+    for path in parquet_paths:
+        pf = pq.ParquetFile(path)
+        meta = pf.metadata
+        file_rows = meta.num_rows
+        total_rows += file_rows
+        file_schema_names = pf.schema_arrow.names
+        col_idx_map = {name: idx for idx, name in enumerate(file_schema_names)}
+
+        for layer in layers:
+            if layer not in col_idx_map:
+                null_counts[layer] += file_rows
+                continue
+            col_idx = col_idx_map[layer]
+            stats_available = True
+            file_nulls = 0
+            for rg in range(meta.num_row_groups):
+                col_meta = meta.row_group(rg).column(col_idx)
+                if col_meta.is_stats_set and col_meta.statistics.has_null_count:
+                    file_nulls += col_meta.statistics.null_count
+                else:
+                    stats_available = False
+                    break
+            if stats_available:
+                null_counts[layer] += file_nulls
+            else:
+                for batch in pf.iter_batches(columns=[layer]):
+                    arr = batch.column(0)
+                    null_counts[layer] += arr.null_count
+
     summary_rows = []
     for layer in layers:
-        valid = int(results_df[layer].notna().sum()) if layer in results_df.columns else 0
-        missing = total - valid
-        pct = (100.0 * valid / total) if total > 0 else 0.0
+        missing = null_counts[layer] if layer not in missing_cols else total_rows
+        valid = max(0, total_rows - missing)
+        pct = (100.0 * valid / total_rows) if total_rows > 0 else 0.0
         summary_rows.append(
             {
                 "layer": layer,
-                "total_rows": total,
+                "total_rows": total_rows,
                 "valid_count": valid,
                 "missing_count": missing,
                 "completeness_pct": round(pct, 2),
@@ -257,7 +407,8 @@ def _search_cmr_for_tile_product(
     variables: List[str],
     start_date: date,
     end_date: date,
-    verbose: bool = False
+    session: Optional[requests.Session] = None,
+    verbose: bool = False,
 ) -> Dict[Tuple[str, str], Dict[str, Any]]:
     tile_product_files = {}
 
@@ -266,7 +417,8 @@ def _search_cmr_for_tile_product(
             product=product,
             tile=tile,
             start_date=start_date,
-            end_date=end_date
+            end_date=end_date,
+            session=session,
         )
 
         if search_results.empty:
@@ -284,122 +436,13 @@ def _search_cmr_for_tile_product(
                     'url': file_row['URL'],
                     'orbit': file_row.get('orbit'),
                     'scene': file_row.get('scene'),
-                    'product': product
+                    'product': product,
                 }
 
     except Exception as e:
         logger.error(f"  [{tile}/{product}] Error searching: {e}")
 
     return tile_product_files
-
-
-def _sample_single_point_granule(
-    session: requests.Session,
-    point_idx: int,
-    point: Point,
-    metadata: dict,
-    lon: float,
-    lat: float,
-    point_tile: str,
-    granule: str,
-    timestamp: Optional[str],
-    orbit: Optional[str],
-    scene: Optional[str],
-    tile_files: Dict,
-    products: Dict[str, List[str]],
-    overpass_granules: Dict[str, Dict[Tuple[str, str, str, str], str]],
-    stars_by_date: Dict[str, str],
-) -> Optional[Dict[str, Any]]:
-    granule_data = {
-        'point_index': point_idx,
-        'granule': granule,
-        'lon': lon,
-        'lat': lat,
-        'tile': point_tile,
-        'timestamp': timestamp,
-        'orbit': orbit,
-        'scene': scene
-    }
-    granule_data.update(metadata)
-
-    has_data = False
-    parts = granule.split('_')
-    product = "_".join(parts[1:3]) if len(parts) > 2 else None
-    ovp_key = _overpass_key(granule)
-
-    if product == 'L2T_LSTE':
-        for variable in products.get('L2T_LSTE', []):
-            key = (granule, variable)
-            if key not in tile_files:
-                continue
-            value, _ = sample_point_from_url(session, tile_files[key]['url'], lon, lat)
-            if value is not None:
-                has_data = True
-                granule_data[variable] = value
-
-        if timestamp and len(timestamp) >= 8:
-            date_str = timestamp[:8]
-            stars_granule = stars_by_date.get(date_str)
-            if stars_granule:
-                for variable in products.get('L2T_STARS', []):
-                    key = (stars_granule, variable)
-                    if key not in tile_files:
-                        continue
-                    value, _ = sample_point_from_url(session, tile_files[key]['url'], lon, lat)
-                    if value is not None:
-                        has_data = True
-                        granule_data[variable] = value
-
-            if ovp_key:
-                for prod, ovp_map in overpass_granules.items():
-                    matched_granule = ovp_map.get(ovp_key)
-                    if not matched_granule:
-                        continue
-                    for variable in products.get(prod, []):
-                        key = (matched_granule, variable)
-                        if key not in tile_files:
-                            continue
-                        value, _ = sample_point_from_url(session, tile_files[key]['url'], lon, lat)
-                        if value is not None:
-                            has_data = True
-                            granule_data[variable] = value
-
-    elif product == 'L2T_STARS':
-        for variable in products.get('L2T_STARS', []):
-            key = (granule, variable)
-            if key not in tile_files:
-                continue
-            value, _ = sample_point_from_url(session, tile_files[key]['url'], lon, lat)
-            if value is not None:
-                has_data = True
-                granule_data[variable] = value
-
-        if len(parts) > 4:
-            date_str = parts[4]
-            for prod, ovp_map in overpass_granules.items():
-                for k, matched_granule in ovp_map.items():
-                    if k[3].startswith(date_str):
-                        for variable in products.get(prod, []):
-                            key = (matched_granule, variable)
-                            if key not in tile_files:
-                                continue
-                            value, _ = sample_point_from_url(session, tile_files[key]['url'], lon, lat)
-                            if value is not None:
-                                has_data = True
-                                granule_data[variable] = value
-                        break
-
-    elif product and (product.startswith('L3T_') or product.startswith('L4T_')):
-        for variable in products.get(product, []):
-            key = (granule, variable)
-            if key not in tile_files:
-                continue
-            value, _ = sample_point_from_url(session, tile_files[key]['url'], lon, lat)
-            if value is not None:
-                has_data = True
-                granule_data[variable] = value
-
-    return granule_data if has_data else None
 
 
 def sample_point_from_url(
@@ -474,14 +517,137 @@ def sample_point_from_url(
     return None, "failed_after_retries"
 
 
-def find_sentinel2_tile(lon: float, lat: float) -> Optional[str]:
-    """Find which Sentinel-2 tile contains the given coordinate."""
+def find_sentinel2_tile(
+    lon: float,
+    lat: float,
+    return_all: bool = False,
+    land_only: bool = True,
+) -> Union[Optional[str], List[str]]:
+    """
+    Find Sentinel-2 MGRS tile(s) containing the given WGS84 coordinate using true
+    polygon intersection via sentinel_tiles.tiles(Point(lon, lat)) and optional
+    land-tile filtering via sentinel_tiles.land(tile).
+    """
     try:
         point = Point(lon, lat)
-        return sentinel_tiles.nearest(point)
+        raw_tiles = sorted(str(t) for t in sentinel_tiles.tiles(point))
+        matching_tiles = [t for t in raw_tiles if sentinel_tiles.land(t)] if land_only else raw_tiles
+
+        if return_all:
+            return matching_tiles
+        return matching_tiles[0] if matching_tiles else None
     except Exception as e:
         logger.error(f"Failed to find Sentinel-2 tile: {e}")
-        return None
+        return [] if return_all else None
+
+
+def _build_granule_sampling_batches(
+    points_data: List[Tuple[Any, Point, Dict[str, Any]]],
+    point_tiles: Dict[Any, str],
+    all_granule_files: Dict[str, Dict[Tuple[str, str], Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """
+    Group point observations by (tile, overpass/granule) so each remote COG variable
+    is opened once per granule batch across all co-located points.
+    """
+    points_by_tile: Dict[str, List[Tuple[Any, Point, Dict[str, Any]]]] = {}
+    for item in points_data:
+        idx = item[0]
+        if idx in point_tiles:
+            points_by_tile.setdefault(point_tiles[idx], []).append(item)
+
+    batches: List[Dict[str, Any]] = []
+    for tile, tile_points in points_by_tile.items():
+        tile_files = all_granule_files.get(tile, {})
+        if not tile_files:
+            continue
+
+        granules = list(dict.fromkeys(g for g, _ in tile_files.keys()))
+        urls_by_granule: Dict[str, Dict[str, str]] = {}
+        for (g, var), info in tile_files.items():
+            urls_by_granule.setdefault(g, {})[var] = info["url"]
+
+        overpass_granules: Dict[str, Dict[Tuple[str, str, str, str], str]] = {}
+        stars_by_date: Dict[str, str] = {}
+        lste_dates: set = set()
+        primary_overpasses = set()
+        primary_dates = set()
+
+        for granule in granules:
+            parts = granule.split('_')
+            product = "_".join(parts[1:3]) if len(parts) > 2 else None
+            ovp_key = _overpass_key(granule)
+            if product == 'L2T_LSTE' and ovp_key:
+                primary_overpasses.add(ovp_key)
+                lste_dates.add(ovp_key[3][:8])
+                primary_dates.add(ovp_key[3][:8])
+            elif product == 'L2T_STARS' and len(parts) > 4:
+                stars_by_date[parts[4]] = granule
+                primary_dates.add(parts[4])
+            elif product and (product.startswith('L3T_') or product.startswith('L4T_')) and ovp_key:
+                overpass_granules.setdefault(product, {})[ovp_key] = granule
+
+        anchor_entries: List[Tuple[str, Optional[str], Optional[str], Optional[str], Dict[str, str]]] = []
+        for granule in granules:
+            parts = granule.split('_')
+            product = "_".join(parts[1:3]) if len(parts) > 2 else None
+            ovp_key = _overpass_key(granule)
+
+            if product == 'L2T_LSTE' and len(parts) > 6:
+                ts = parts[6]
+                merged_urls = dict(urls_by_granule.get(granule, {}))
+                stars_g = stars_by_date.get(ts[:8])
+                if stars_g:
+                    merged_urls.update(urls_by_granule.get(stars_g, {}))
+                if ovp_key:
+                    for ovp_map in overpass_granules.values():
+                        matched_g = ovp_map.get(ovp_key)
+                        if matched_g:
+                            merged_urls.update(urls_by_granule.get(matched_g, {}))
+                anchor_entries.append((granule, ts, parts[3], parts[4], merged_urls))
+            elif product == 'L2T_STARS' and len(parts) > 4:
+                date_str = parts[4]
+                if date_str in lste_dates:
+                    continue
+                merged_urls = dict(urls_by_granule.get(granule, {}))
+                for ovp_map in overpass_granules.values():
+                    for k, matched_g in ovp_map.items():
+                        if k[3].startswith(date_str):
+                            merged_urls.update(urls_by_granule.get(matched_g, {}))
+                            break
+                anchor_entries.append((granule, date_str, None, None, merged_urls))
+
+        for ovp_map in overpass_granules.values():
+            for ovp_key, granule in ovp_map.items():
+                if ovp_key in primary_overpasses or ovp_key[3][:8] in primary_dates:
+                    continue
+                anchor_entries.append(
+                    (granule, ovp_key[3], ovp_key[0], ovp_key[1], dict(urls_by_granule.get(granule, {})))
+                )
+
+        coords = [(pt.x, pt.y) for _, pt, _ in tile_points]
+        for granule, ts, orbit, scene, merged_urls in anchor_entries:
+            meta_rows = []
+            for idx, _, metadata in tile_points:
+                row_meta = {
+                    "point_index": idx,
+                    "granule": granule,
+                    "tile": tile,
+                    "timestamp": ts,
+                    "orbit": orbit,
+                    "scene": scene,
+                }
+                row_meta.update(metadata)
+                meta_rows.append(row_meta)
+            batches.append(
+                {
+                    "variable_urls": merged_urls,
+                    "coords": coords,
+                    "metadata_rows": meta_rows,
+                }
+            )
+
+    return batches
 
 
 def sample_points_over_date_range(
@@ -493,7 +659,8 @@ def sample_points_over_date_range(
     session: Optional[requests.Session] = None,
     max_workers: int = 10,
     drop_na: bool = True,
-    verbose: bool = True
+    use_vsicurl: bool = True,
+    verbose: bool = True,
 ) -> pd.DataFrame:
     """Sample ECOSTRESS data at multiple points for all available acquisitions in a date range."""
     if layers is None:
@@ -597,7 +764,7 @@ def sample_points_over_date_range(
             future_to_search = {
                 executor.submit(
                     _search_cmr_for_tile_product,
-                    t, prod, vars_list, start_date, end_date, False
+                    t, prod, vars_list, start_date, end_date, session, False
                 ): (t, prod) for t, prod, vars_list in search_combinations
             }
             for future in as_completed(future_to_search):
@@ -607,96 +774,54 @@ def sample_points_over_date_range(
         for t in tiles_to_search:
             tile_files = {}
             for prod, vars_list in products.items():
-                tile_files.update(_search_cmr_for_tile_product(t, prod, vars_list, start_date, end_date, verbose))
+                tile_files.update(
+                    _search_cmr_for_tile_product(t, prod, vars_list, start_date, end_date, session, verbose)
+                )
             all_granule_files[t] = tile_files
 
-    granules_by_tile = {
-        t: list(dict.fromkeys(granule for granule, _ in tf.keys()))
-        for t, tf in all_granule_files.items()
-    }
-
-    sampling_tasks = []
-    for idx, point, metadata in points_data:
-        if idx not in point_tiles:
-            continue
-        lon, lat = point.x, point.y
-        point_tile = point_tiles[idx]
-        tile_files = all_granule_files.get(point_tile, {})
-        granules = granules_by_tile.get(point_tile, [])
-        if not granules:
-            continue
-
-        overpass_granules: Dict[str, Dict[Tuple[str, str, str, str], str]] = {}
-        stars_by_date: Dict[str, str] = {}
-        primary_overpasses = set()
-        primary_dates = set()
-
-        for granule in granules:
-            parts = granule.split('_')
-            product = "_".join(parts[1:3]) if len(parts) > 2 else None
-            ovp_key = _overpass_key(granule)
-
-            if product == 'L2T_LSTE' and ovp_key:
-                primary_overpasses.add(ovp_key)
-                primary_dates.add(ovp_key[3][:8])
-            elif product == 'L2T_STARS' and len(parts) > 4:
-                stars_by_date[parts[4]] = granule
-                primary_dates.add(parts[4])
-            elif product and (product.startswith('L3T_') or product.startswith('L4T_')) and ovp_key:
-                overpass_granules.setdefault(product, {})[ovp_key] = granule
-
-        for granule in granules:
-            parts = granule.split('_')
-            product = "_".join(parts[1:3]) if len(parts) > 2 else None
-            if product == 'L2T_LSTE' and len(parts) > 6:
-                sampling_tasks.append((
-                    idx, point, metadata, lon, lat, point_tile,
-                    granule, parts[6], parts[3], parts[4],
-                    tile_files, products, overpass_granules, stars_by_date
-                ))
-            elif product == 'L2T_STARS' and len(parts) > 4:
-                sampling_tasks.append((
-                    idx, point, metadata, lon, lat, point_tile,
-                    granule, parts[4], None, None,
-                    tile_files, products, overpass_granules, stars_by_date
-                ))
-
-        for ovp_map in overpass_granules.values():
-            for ovp_key, granule in ovp_map.items():
-                if ovp_key in primary_overpasses or ovp_key[3][:8] in primary_dates:
-                    continue
-                sampling_tasks.append((
-                    idx, point, metadata, lon, lat, point_tile,
-                    granule, ovp_key[3], ovp_key[0], ovp_key[1],
-                    tile_files, products, overpass_granules, stars_by_date
-                ))
-
-    all_results = []
-    if max_workers > 1 and sampling_tasks:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_sample_single_point_granule, session, *t) for t in sampling_tasks]
-            for future in as_completed(futures):
-                res = future.result()
-                if res is not None:
-                    all_results.append(res)
-    else:
-        for t in sampling_tasks:
-            res = _sample_single_point_granule(session, *t)
-            if res is not None:
-                all_results.append(res)
-
-    if not all_results:
+    batches = _build_granule_sampling_batches(points_data, point_tiles, all_granule_files)
+    if not batches:
         return pd.DataFrame()
 
-    results_df = pd.DataFrame(all_results)
-    results_df = _apply_layer_names(results_df, layers)
+    stream_semaphore = threading.Semaphore(max(1, max_workers * 2))
+    batch_frames: List[pd.DataFrame] = []
 
-    if drop_na and len(results_df) > 0:
-        sampled_cols = [col for col in results_df.columns if col in layers]
-        if sampled_cols:
+    def _run_batch(batch: Dict[str, Any]) -> pd.DataFrame:
+        return sample_points_from_granule(
+            variable_urls=batch["variable_urls"],
+            coords=batch["coords"],
+            layers=layers,
+            session=session,
+            use_vsicurl=use_vsicurl,
+            metadata_rows=batch["metadata_rows"],
+            max_workers=max_workers,
+            stream_semaphore=stream_semaphore,
+        )
+
+    if max_workers > 1 and len(batches) > 1:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as executor:
+            for future in as_completed([executor.submit(_run_batch, b) for b in batches]):
+                df_part = future.result()
+                if not df_part.empty:
+                    batch_frames.append(df_part)
+    else:
+        for b in batches:
+            df_part = _run_batch(b)
+            if not df_part.empty:
+                batch_frames.append(df_part)
+
+    if not batch_frames:
+        return pd.DataFrame()
+
+    results_df = pd.concat(batch_frames, ignore_index=True)
+    sampled_cols = [col for col in results_df.columns if col in layers]
+    if sampled_cols:
+        if drop_na:
             results_df = results_df[results_df[sampled_cols].notna().all(axis=1)]
+        else:
+            results_df = results_df[results_df[sampled_cols].notna().any(axis=1)]
 
-    return results_df
+    return results_df.reset_index(drop=True)
 
 
 def sample_points_from_geodataframe(
@@ -706,11 +831,16 @@ def sample_points_from_geodataframe(
     tile_col: Optional[str] = None,
     session: Optional[requests.Session] = None,
     date_buffer_days: int = 0,
-    verbose: bool = True
+    max_workers: int = 10,
+    use_vsicurl: bool = True,
+    verbose: bool = True,
 ) -> pd.DataFrame:
-    """Sample ECOSTRESS data at multiple points with known acquisition times."""
+    """
+    Sample ECOSTRESS data at multiple points with known acquisition times,
+    grouping CMR searches by (tile, date_window) and joining L2T_STARS priors by date.
+    """
     if layers is None:
-        layers = DEFAULT_LAYERS
+        layers = DEFAULT_LAYERS.copy()
 
     if isinstance(geometry, list):
         gdf = gpd.GeoDataFrame({'geometry': geometry}, crs='EPSG:4326')
@@ -743,76 +873,64 @@ def sample_points_from_geodataframe(
     if session is None:
         session = setup_earthdata_session()
 
-    all_results = []
+    grouped_rows: Dict[Tuple[str, date, date], List[Tuple[Any, Point, Dict[str, Any]]]] = {}
     for idx, row in gdf.iterrows():
-        point = row['geometry']
+        point = row[geometry_col]
         dt = row[datetime_col]
         if not isinstance(point, Point):
             continue
 
         lon, lat = point.x, point.y
-        search_date = dt.date() if isinstance(dt, datetime) else (dt if isinstance(dt, date) else pd.to_datetime(dt).date())
-        tile = row[tile_col] if (tile_col and tile_col in row) else find_sentinel2_tile(lon, lat)
+        search_date = (
+            dt.date()
+            if isinstance(dt, datetime)
+            else (dt if isinstance(dt, date) else pd.to_datetime(dt).date())
+        )
+        tile = row[tile_col] if (tile_col and tile_col in row and pd.notna(row[tile_col])) else find_sentinel2_tile(lon, lat)
         if not tile:
             continue
 
         start_date = search_date - timedelta(days=date_buffer_days)
         end_date = search_date + timedelta(days=date_buffer_days)
+        meta = {col: row[col] for col in gdf.columns if col != geometry_col}
+        meta["search_date"] = search_date
+        grouped_rows.setdefault((tile, start_date, end_date), []).append((idx, point, meta))
 
-        point_files = {}
-        for product, variables in products.items():
-            search_results = ECOSTRESS_CMR_search(
-                product=product,
-                tile=tile,
-                start_date=start_date,
-                end_date=end_date
-            )
-            if search_results.empty:
-                continue
-            for variable in variables:
-                var_files = search_results[
-                    (search_results['type'] == 'GeoTIFF Data') &
-                    (search_results['variable'] == variable)
-                ]
-                for _, file_row in var_files.iterrows():
-                    point_files[(file_row['granule'], variable)] = file_row['URL']
-
-        if not point_files:
-            continue
-
-        unique_granules = list(dict.fromkeys(g for g, _ in point_files.keys()))
-        for granule in unique_granules:
-            granule_data = {
-                'gdf_index': idx,
-                'granule': granule,
-                'lon': lon,
-                'lat': lat,
-                'tile': tile,
-                'search_date': search_date
-            }
-            for col in gdf.columns:
-                if col != geometry_col and col not in granule_data:
-                    granule_data[col] = row[col]
-
-            parts = granule.split('_')
-            if len(parts) > 6:
-                granule_data['timestamp'] = parts[6] if 'T' in parts[6] else parts[4]
-
-            has_data = False
-            for variable in [v for vars_list in products.values() for v in vars_list]:
-                url = point_files.get((granule, variable))
-                if not url:
-                    continue
-                value, _ = sample_point_from_url(session, url, lon, lat)
-                if value is not None:
-                    has_data = True
-                    granule_data[variable] = value
-
-            if has_data:
-                all_results.append(granule_data)
-
-    if not all_results:
+    if not grouped_rows:
         return pd.DataFrame()
 
-    results_df = pd.DataFrame(all_results)
-    return _apply_layer_names(results_df, layers)
+    all_frames: List[pd.DataFrame] = []
+    for (tile, start_date, end_date), group_points in grouped_rows.items():
+        tile_files: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for prod, vars_list in products.items():
+            tile_files.update(
+                _search_cmr_for_tile_product(tile, prod, vars_list, start_date, end_date, session, verbose)
+            )
+        if not tile_files:
+            continue
+
+        point_tiles = {idx: tile for idx, _, _ in group_points}
+        batches = _build_granule_sampling_batches(group_points, point_tiles, {tile: tile_files})
+        for batch in batches:
+            for meta in batch["metadata_rows"]:
+                meta["gdf_index"] = meta.pop("point_index")
+            df_part = sample_points_from_granule(
+                variable_urls=batch["variable_urls"],
+                coords=batch["coords"],
+                layers=layers,
+                session=session,
+                use_vsicurl=use_vsicurl,
+                metadata_rows=batch["metadata_rows"],
+                max_workers=max_workers,
+            )
+            if not df_part.empty:
+                all_frames.append(df_part)
+
+    if not all_frames:
+        return pd.DataFrame()
+
+    results_df = pd.concat(all_frames, ignore_index=True)
+    sampled_cols = [col for col in results_df.columns if col in layers]
+    if sampled_cols:
+        results_df = results_df[results_df[sampled_cols].notna().any(axis=1)]
+    return results_df.reset_index(drop=True)
