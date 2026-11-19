@@ -167,7 +167,4 @@ cython_debug/
 
 data/
 repomix-output.xml
-stratified_dataset_output/
-stratified_dataset_test/
-uq_dataset_output/
-uq_dataset_test/
+experimental_data/
