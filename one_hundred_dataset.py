@@ -4,17 +4,14 @@ Scale example 100-observation stratified ECOSTRESS Collection 3 dataset
 generator accompanying the full-scale one_million_dataset.py runner.
 
 Usage:
-    # Fast multi-biome 100-sample pilot run (~30-60s end-to-end)
+    # Fast multi-biome 100-sample pilot run (~35-50s end-to-end, including humid tropical tile)
     python one_hundred_dataset.py
 
+    # Pre-flight capacity plan dry-run without downloading COGs
+    python one_hundred_dataset.py --dry-run
+
     # Sample 100 observations globally by reusing the 1M run's cached catalog
-    python one_hundred_dataset.py \
-        --tiles-global \
-        --start-date 2025-10-31 \
-        --end-date 2026-10-31 \
-        --min-granules-floor 4 \
-        --catalog-path ./experimental_data/one_million_dataset/candidate_granules.parquet \
-        --output-dir ./experimental_data/one_hundred_global_dataset
+    python one_hundred_dataset.py --tiles-global --start-date 2025-10-31 --end-date 2026-10-31 --min-granules-floor 4
 """
 
 import argparse
@@ -31,7 +28,9 @@ from ECOv003_CMR import (
     setup_earthdata_session,
 )
 
-DEFAULT_PILOT_TILES = ["11SLT", "11SPS", "52NHN", "53NMH"]
+# Includes 20LLQ (Amazon tropical) to exercise sidecar QAPercentCloudCover rejection & backfill
+DEFAULT_PILOT_TILES = ["11SLT", "11SPS", "52NHN", "53NMH", "20LLQ"]
+SHARED_1M_CATALOG = Path("./experimental_data/one_million_dataset/candidate_granules.parquet")
 
 
 def configure_logging(output_dir: Path) -> None:
@@ -64,7 +63,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=str,
         default="./experimental_data/one_hundred_dataset",
-        help="Directory for partitioned Parquet outputs, checkpoint manifest, and catalog cache (default: ./experimental_data/one_hundred_dataset).",
+        help="Directory for partitioned Parquet outputs, checkpoint manifest, and catalog cache.",
     )
     parser.add_argument(
         "--start-date",
@@ -83,7 +82,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         nargs="+",
         default=DEFAULT_PILOT_TILES,
-        help="Subset of Sentinel-2 MGRS tiles for the fast scale example (default: 11SLT 11SPS 52NHN 53NMH).",
+        help="Subset of Sentinel-2 MGRS tiles for the fast scale example.",
     )
     parser.add_argument(
         "--tiles-global",
@@ -106,7 +105,7 @@ def parse_args() -> argparse.Namespace:
         "--max-cloud-cover",
         type=float,
         default=20.0,
-        help="Maximum CMR granule cloud cover percentage (default: 20.0).",
+        help="Maximum sidecar QAPercentCloudCover percentage (default: 20.0).",
     )
     parser.add_argument(
         "--dispersion-strategy",
@@ -160,7 +159,12 @@ def parse_args() -> argparse.Namespace:
         "--export-csv",
         action="store_true",
         default=True,
-        help="Write CSV alongside each partitioned Parquet file (default: True for 100-row scale example).",
+        help="Write CSV alongside each partitioned Parquet file (default: True).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run discovery and stratification capacity planning only without reading COGs.",
     )
     parser.add_argument(
         "--seed",
@@ -188,13 +192,18 @@ def main() -> None:
     logger = logging.getLogger("one_hundred_dataset")
 
     selected_tiles = None if args.tiles_global else args.tiles
+    catalog_path = args.catalog_path
+    if catalog_path is None and args.tiles_global and SHARED_1M_CATALOG.exists():
+        catalog_path = str(SHARED_1M_CATALOG)
+        logger.info(f"Auto-reusing shared global catalog cache: {catalog_path}")
 
     logger.info("Starting ECOSTRESS Collection 3 UQ 100-observation scale example")
     logger.info(
         f"Configuration: window={args.start_date}..{args.end_date}, "
         f"tiles={'GLOBAL' if selected_tiles is None else ','.join(selected_tiles)}, "
         f"target_samples={args.target_samples:,}, min_granules_floor={args.min_granules_floor}, "
-        f"max_cloud_cover={args.max_cloud_cover}%, workers={args.max_workers}x{args.layer_workers} "
+        f"max_cloud_cover={args.max_cloud_cover}%, dry_run={args.dry_run}, "
+        f"workers={args.max_workers}x{args.layer_workers} "
         f"(streams={args.max_concurrent_streams}, batch_size={args.batch_size})"
     )
 
@@ -215,9 +224,10 @@ def main() -> None:
         layer_workers=args.layer_workers,
         max_concurrent_streams=args.max_concurrent_streams,
         batch_size=args.batch_size,
-        catalog_path=args.catalog_path,
+        catalog_path=catalog_path,
         refresh_catalog=args.refresh_catalog,
         export_csv=args.export_csv,
+        dry_run=args.dry_run,
         random_state=args.seed,
         session=session,
         verbose=True,
@@ -237,12 +247,18 @@ def main() -> None:
 
     print("\n=== UQ 100-Observation Scale Example Summary ===")
     print(f"Output directory  : {output_dir.resolve()}")
+    print(f"Dry run           : {summary.get('dry_run', False)}")
     print(f"Collected samples : {summary.get('total_samples', 0):,}")
     print(f"Selected granules : {summary.get('selected_granules', 0):,} (N_cap={summary.get('n_cap', 0)}, K={summary.get('quota_k', 0)})")
 
+    plan = summary.get("stratification_plan")
+    if plan is not None and not plan.empty:
+        print("\nPre-Flight Stratification Plan:")
+        print(plan.to_string(index=False))
+
     perf = summary.get("performance", {})
-    if perf:
-        print(f"Total wall time   : {perf.get('timings_s', {}).get('total_s', 0):.2f}s")
+    if perf and not args.dry_run:
+        print(f"\nTotal wall time   : {perf.get('timings_s', {}).get('total_s', 0):.2f}s")
         print(f"Mean per-granule  : {perf.get('mean_granule_latency_s', 0):.2f}s")
         print(f"Throughput        : {perf.get('samples_per_second', 0):.2f} samples/s")
 

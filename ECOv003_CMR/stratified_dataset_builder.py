@@ -29,6 +29,7 @@ from .stratified_sampling import (
     compute_per_granule_quota,
     extract_valid_swath_mask,
     find_clear_sky_et_granules,
+    plan_stratified_sampling,
     resolve_granule_asset_urls,
     sample_granule_coordinates,
     select_stratified_granules,
@@ -67,6 +68,17 @@ def _format_duration(seconds: float) -> str:
     if seconds < 86400:
         return f"{seconds / 3600:.2f}h"
     return f"{seconds / 86400:.2f}d"
+
+
+def _backfill_multiplier_for_cloud_cover(max_cloud_cover: Optional[float]) -> int:
+    """Scale Stage [4/6] backfill candidate slice to empirical sidecar rejection rates."""
+    if max_cloud_cover is None or max_cloud_cover >= 50.0:
+        return 2
+    if max_cloud_cover >= 20.0:
+        return 4
+    if max_cloud_cover >= 10.0:
+        return 5
+    return 12
 
 
 def _load_completed_manifest(manifest_path: str) -> set:
@@ -161,23 +173,25 @@ def build_stratified_dataset(
     grid_divisions: int = 6,
     layers: Optional[List[str]] = None,
     max_cloud_cover: Optional[float] = 20.0,
-    max_workers: int = 8,
+    max_workers: int = 12,
     layer_workers: int = 8,
-    max_concurrent_streams: int = 32,
+    max_concurrent_streams: int = 48,
     batch_size: int = 250,
     catalog_path: Optional[str] = None,
     refresh_catalog: bool = False,
     export_csv: bool = False,
+    dry_run: bool = False,
     random_state: int = 42,
     session: Optional[requests.Session] = None,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
     Build a spatially and seasonally stratified ECOSTRESS Collection 3 point-sample
-    dataset with CMR CSV catalog discovery, lazy post-stratification asset URL
-    & sidecar QAPercentCloudCover resolution, bounded HTTP stream concurrency,
-    synchronous URS cookie refresh across batches, adaptive quota refills, and
-    O(1)-memory Parquet diagnostics.
+    dataset with CMR CSV catalog discovery, pre-flight capacity & biome planning,
+    lazy post-stratification asset URL & sidecar QAPercentCloudCover resolution,
+    rejection-aware backfill, bounded HTTP stream concurrency, synchronous URS
+    cookie refresh across batches, adaptive quota refills, and O(1)-memory
+    Parquet diagnostics.
     """
     t_start = time.perf_counter()
     timings: Dict[str, float] = {}
@@ -247,7 +261,14 @@ def build_stratified_dataset(
 
     if candidate_granules.empty:
         _log("[3/6] No complete multi-product clear-sky ET granules found for the given window.")
-        return {"total_samples": 0, "selected_granules": 0, "n_cap": 0, "timings": timings}
+        return {
+            "total_samples": 0,
+            "selected_granules": 0,
+            "n_cap": 0,
+            "dry_run": dry_run,
+            "stratification_plan": pd.DataFrame(),
+            "timings": timings,
+        }
 
     tile_counts = candidate_granules.groupby("tile").size().to_dict()
     tile_preview = dict(list(tile_counts.items())[:10])
@@ -256,6 +277,17 @@ def build_stratified_dataset(
         f"[3/6] Found {len(candidate_granules):,} candidate overpasses across "
         f"{len(tile_counts):,} tiles: {tile_preview}{suffix} ({timings['cmr_search_s']:.2f}s)"
     )
+
+    candidate_floors = sorted({1, 2, 4, 6, 8, int(min_granules_floor)})
+    stratification_plan = plan_stratified_sampling(
+        catalog_df=candidate_granules,
+        target_total_samples=target_total_samples,
+        candidate_floors=candidate_floors,
+        max_cloud_cover=max_cloud_cover,
+        max_workers=max_workers,
+    )
+    if verbose and not stratification_plan.empty:
+        _log("[3/6] Pre-flight stratification capacity plan:\n" + stratification_plan.to_string(index=False))
 
     t0 = time.perf_counter()
     selected_granules, n_cap = select_stratified_granules(
@@ -266,7 +298,38 @@ def build_stratified_dataset(
     )
     if selected_granules.empty:
         _log(f"[4/6] No tiles met min_granules_floor={min_granules_floor}.")
-        return {"total_samples": 0, "selected_granules": 0, "n_cap": 0, "timings": timings}
+        return {
+            "total_samples": 0,
+            "selected_granules": 0,
+            "n_cap": 0,
+            "dry_run": dry_run,
+            "stratification_plan": stratification_plan,
+            "timings": timings,
+        }
+
+    if dry_run:
+        quota_k, candidate_n = compute_per_granule_quota(
+            num_selected_granules=len(selected_granules),
+            target_total_samples=target_total_samples,
+            oversample_factor=oversample_factor,
+        )
+        timings["selection_s"] = time.perf_counter() - t0
+        timings["total_s"] = time.perf_counter() - t_start
+        _log(
+            f"[4/6] Dry-run complete: {len(selected_granules):,} candidate granules across "
+            f"{selected_granules['tile'].nunique():,} eligible tile(s) (N_cap={n_cap}, "
+            f"quota_K={quota_k}, candidate_draw_N={candidate_n}). Skipping Stage [5/6] COG extraction."
+        )
+        return {
+            "total_samples": 0,
+            "selected_granules": len(selected_granules),
+            "n_cap": n_cap,
+            "quota_k": quota_k,
+            "dry_run": True,
+            "stratification_plan": stratification_plan,
+            "coverage_summary": pd.DataFrame(),
+            "performance": {"timings_s": {k: round(v, 3) for k, v in timings.items()}},
+        }
 
     # Resolve GeoTIFF asset URLs & sidecar QAPercentCloudCover lazily for selected granules
     if "variable_urls" not in selected_granules.columns or not selected_granules["variable_urls"].apply(
@@ -293,9 +356,10 @@ def build_stratified_dataset(
                 if resolved_counts.get(t, 0) < n_cap
             }
             if deficits and not remaining_candidates.empty:
+                backfill_mult = _backfill_multiplier_for_cloud_cover(max_cloud_cover)
                 backfill_rows = []
                 for t, need in deficits.items():
-                    t_pool = remaining_candidates[remaining_candidates["tile"] == t].head(need * 3)
+                    t_pool = remaining_candidates[remaining_candidates["tile"] == t].head(need * backfill_mult)
                     if not t_pool.empty:
                         backfill_rows.append(t_pool)
                 if backfill_rows:
@@ -318,7 +382,14 @@ def build_stratified_dataset(
 
     if selected_granules.empty:
         _log("[4/6] No complete clear-sky multi-product granules remained after URL & sidecar resolution.")
-        return {"total_samples": 0, "selected_granules": 0, "n_cap": 0, "timings": timings}
+        return {
+            "total_samples": 0,
+            "selected_granules": 0,
+            "n_cap": 0,
+            "dry_run": False,
+            "stratification_plan": stratification_plan,
+            "timings": timings,
+        }
 
     quota_k, candidate_n = compute_per_granule_quota(
         num_selected_granules=len(selected_granules),
@@ -584,6 +655,8 @@ def build_stratified_dataset(
         "selected_granules": n_granules,
         "n_cap": n_cap,
         "quota_k": quota_k,
+        "dry_run": False,
+        "stratification_plan": stratification_plan,
         "coverage_summary": coverage_summary,
         "performance": performance,
     }

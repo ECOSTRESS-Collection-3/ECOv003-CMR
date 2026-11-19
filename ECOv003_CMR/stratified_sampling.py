@@ -10,6 +10,7 @@ import rasterio
 from rasterio.crs import CRS
 from rasterio.warp import transform
 import requests
+from sentinel_tiles import sentinel_tiles
 from tqdm.auto import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
@@ -35,6 +36,290 @@ def _extract_granule_join_keys(granule: str) -> Tuple[str, Optional[int], Option
 
 def _batched(items: Sequence[Any], batch_size: int) -> List[Sequence[Any]]:
     return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
+
+
+def _expected_cloud_pass_rate(max_cloud_cover: Optional[float]) -> float:
+    """Empirical global L3T_JET clear-sky pass rates from QAPercentCloudCover census."""
+    if max_cloud_cover is None or max_cloud_cover >= 100.0:
+        return 1.0
+    if max_cloud_cover >= 20.0:
+        return 0.545
+    if max_cloud_cover >= 10.0:
+        return 0.414
+    if max_cloud_cover > 0.0:
+        return 0.250
+    return 0.060
+
+
+def _tile_latitude_band(tile: str) -> str:
+    """Classify an MGRS tile into 'tropical' (|lat|<=15), 'temperate' (15<|lat|<=50), or 'boreal' (>50)."""
+    try:
+        polys = sentinel_tiles.sentinel_polygons
+        match = polys[polys["Name"] == tile]
+        if not match.empty:
+            lat = float(match.geometry.iloc[0].centroid.y)
+            abs_lat = abs(lat)
+            if abs_lat <= 15.0:
+                return "tropical"
+            if abs_lat <= 50.0:
+                return "temperate"
+            return "boreal"
+    except Exception:
+        pass
+    # Fallback to MGRS latitude band letter (C..X, excluding I and O)
+    if len(tile) >= 3 and tile[2].isalpha():
+        band_letter = tile[2].upper()
+        if band_letter in ("L", "M", "N", "P"):
+            return "tropical"
+        if band_letter in ("C", "D", "E", "U", "V", "W", "X"):
+            return "boreal"
+    return "temperate"
+
+
+def plan_stratified_sampling(
+    catalog_df: pd.DataFrame,
+    target_total_samples: int = 1_000_000,
+    candidate_floors: Sequence[int] = (2, 4, 6, 8),
+    max_cloud_cover: Optional[float] = 20.0,
+    expected_cloud_pass_rate: Optional[float] = None,
+    max_workers: int = 12,
+    mean_granule_latency_s: float = 8.72,
+) -> pd.DataFrame:
+    """
+    Evaluate candidate min_granules_floor thresholds offline in <1s against a
+    granule catalog (before resolving COGs) to forecast eligible tile counts,
+    latitudinal biome coverage, effective N_cap, selected granules G, per-granule
+    pixel quota K, and estimated Stage [5/6] wall time.
+    """
+    columns = [
+        "min_granules_floor",
+        "eligible_tiles",
+        "tropical_tiles",
+        "temperate_tiles",
+        "boreal_tiles",
+        "n_cap",
+        "selected_granules",
+        "quota_k",
+        "est_wall_minutes",
+    ]
+    if catalog_df.empty or "tile" not in catalog_df.columns:
+        return pd.DataFrame(columns=columns)
+
+    pass_rate = (
+        float(expected_cloud_pass_rate)
+        if expected_cloud_pass_rate is not None
+        else _expected_cloud_pass_rate(max_cloud_cover)
+    )
+    # If cloud_cover is already populated on the catalog, counts are already filtered
+    already_filtered = (
+        "cloud_cover" in catalog_df.columns
+        and catalog_df["cloud_cover"].notna().any()
+    )
+    effective_rate = 1.0 if already_filtered else max(0.01, pass_rate)
+
+    tile_counts = catalog_df.groupby("tile").size()
+    expected_clear_counts = tile_counts * effective_rate
+    tile_bands = {t: _tile_latitude_band(str(t)) for t in tile_counts.index}
+
+    rows: List[Dict[str, Any]] = []
+    workers = max(1, int(max_workers))
+    for floor in candidate_floors:
+        surviving = expected_clear_counts[expected_clear_counts >= floor]
+        if surviving.empty:
+            rows.append(
+                {
+                    "min_granules_floor": int(floor),
+                    "eligible_tiles": 0,
+                    "tropical_tiles": 0,
+                    "temperate_tiles": 0,
+                    "boreal_tiles": 0,
+                    "n_cap": 0,
+                    "selected_granules": 0,
+                    "quota_k": 0,
+                    "est_wall_minutes": 0.0,
+                }
+            )
+            continue
+
+        n_cap = max(int(floor), int(math.floor(surviving.min())))
+        n_tiles = int(len(surviving))
+        selected_g = n_tiles * n_cap
+        quota_k = math.ceil(target_total_samples / selected_g)
+        est_minutes = (selected_g * mean_granule_latency_s / workers) / 60.0
+
+        bands = [tile_bands[t] for t in surviving.index]
+        rows.append(
+            {
+                "min_granules_floor": int(floor),
+                "eligible_tiles": n_tiles,
+                "tropical_tiles": sum(1 for b in bands if b == "tropical"),
+                "temperate_tiles": sum(1 for b in bands if b == "temperate"),
+                "boreal_tiles": sum(1 for b in bands if b == "boreal"),
+                "n_cap": n_cap,
+                "selected_granules": selected_g,
+                "quota_k": quota_k,
+                "est_wall_minutes": round(est_minutes, 1),
+            }
+        )
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def estimate_cloud_cover_distribution(
+    catalog_df: pd.DataFrame,
+    thresholds: Sequence[float] = (20.0, 10.0, 0.0),
+    sample_size: Optional[int] = 2000,
+    CMR_search_URL: str = CMR_SEARCH_URL,
+    session: Optional[requests.Session] = None,
+    cmr_workers: int = 6,
+    sidecar_workers: int = 32,
+    random_state: int = 42,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Estimate scene cloud-cover percentages and threshold pass rates for a granule
+    catalog by reading ProductMetadata.QAPercentCloudCover from per-granule .json
+    sidecars on a seasonally stratified sample (or all rows when sample_size is None).
+    """
+    total_scenes = len(catalog_df)
+    if total_scenes == 0:
+        return {
+            "total_scenes": 0,
+            "checked_scenes": 0,
+            "is_exact": True,
+            "thresholds": pd.DataFrame(),
+            "by_latitude_band": pd.DataFrame(),
+        }
+
+    is_exact = sample_size is None or sample_size <= 0 or sample_size >= total_scenes
+    if is_exact:
+        target_df = catalog_df.copy()
+    else:
+        rng = np.random.default_rng(random_state)
+        df = catalog_df.copy()
+        df["_month"] = df["date_str"].astype(str).str[4:6]
+        per_month = max(1, math.ceil(sample_size / max(1, df["_month"].nunique())))
+        parts = []
+        for _, grp in df.groupby("_month", sort=True):
+            take = min(per_month, len(grp))
+            idx = rng.choice(grp.index.to_numpy(), size=take, replace=False)
+            parts.append(grp.loc[idx])
+        target_df = pd.concat(parts, ignore_index=True)
+        if len(target_df) > sample_size:
+            target_df = target_df.sample(n=sample_size, random_state=random_state).reset_index(drop=True)
+
+    stems = sorted(
+        {
+            f"{int(r.orbit):05d}_{int(r.scene):03d}_{r.tile}_{r.timestamp}"
+            for r in target_df.itertuples()
+            if pd.notna(r.orbit) and pd.notna(r.scene)
+        }
+    )
+    batches = _batched(stems, 150)
+
+    json_entries: List[Dict[str, Any]] = []
+    with logging_redirect_tqdm(), ThreadPoolExecutor(
+        max_workers=max(1, min(cmr_workers, max(1, len(batches))))
+    ) as pool:
+        futures = [
+            pool.submit(
+                search_granules_by_name_patterns,
+                CONCEPT_IDS["L2T_LSTE"],
+                [f"ECOv003_L2T_LSTE_{s}_*" for s in batch],
+                None,
+                False,
+                (".json",),
+                CMR_search_URL,
+                session,
+            )
+            for batch in batches
+        ]
+        for fut in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc="Resolving .json URLs",
+            unit="batch",
+            dynamic_ncols=True,
+            disable=not verbose,
+        ):
+            entries = fut.result()
+            if entries:
+                json_entries.extend(entries)
+
+    json_urls: List[str] = []
+    if json_entries:
+        parsed = interpret_ECOSTRESS_URLs([e["URL"] for e in json_entries])
+        json_urls = parsed[parsed["type"] == "JSON Metadata"]["URL"].tolist()
+
+    def _read_cc(url: str) -> Optional[Tuple[str, float]]:
+        try:
+            meta = fetch_granule_metadata(url, session=session, timeout=30)
+            cc = meta.get("cloud_cover")
+            if cc is None:
+                return None
+            parts = url.rsplit("/", 1)[-1].split("_")
+            tile = parts[5] if len(parts) > 5 else ""
+            return tile, float(cc)
+        except Exception:
+            return None
+
+    records: List[Dict[str, Any]] = []
+    with logging_redirect_tqdm(), ThreadPoolExecutor(
+        max_workers=max(1, min(sidecar_workers, max(1, len(json_urls))))
+    ) as pool:
+        futures = [pool.submit(_read_cc, u) for u in json_urls]
+        for fut in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc="Reading QAPercentCloudCover",
+            unit="json",
+            dynamic_ncols=True,
+            disable=not verbose,
+        ):
+            res = fut.result()
+            if res is not None:
+                tile, cc = res
+                records.append({"tile": tile, "band": _tile_latitude_band(tile), "cloud_cover": cc})
+
+    rec_df = pd.DataFrame(records)
+    n_checked = len(rec_df)
+    thresh_rows: List[Dict[str, Any]] = []
+    if n_checked > 0:
+        cc_arr = rec_df["cloud_cover"].to_numpy(dtype=float)
+        for thresh in thresholds:
+            frac = float(np.mean(cc_arr <= thresh))
+            est_scenes = int(round(frac * total_scenes))
+            se = math.sqrt(frac * (1.0 - frac) / n_checked) if not is_exact else 0.0
+            ci_95 = int(round(1.96 * se * total_scenes))
+            thresh_rows.append(
+                {
+                    "max_cloud_cover": float(thresh),
+                    "pass_rate_pct": round(100.0 * frac, 1),
+                    "estimated_scenes": est_scenes,
+                    "ci_95_scenes": ci_95,
+                }
+            )
+
+    band_rows: List[Dict[str, Any]] = []
+    if n_checked > 0:
+        primary_thresh = float(thresholds[0]) if thresholds else 20.0
+        for band_name, grp in rec_df.groupby("band", sort=True):
+            frac = float((grp["cloud_cover"] <= primary_thresh).mean())
+            band_rows.append(
+                {
+                    "latitude_band": band_name,
+                    "checked_scenes": int(len(grp)),
+                    f"pass_rate_le_{int(primary_thresh)}pct": round(100.0 * frac, 1),
+                }
+            )
+
+    return {
+        "total_scenes": total_scenes,
+        "checked_scenes": n_checked,
+        "is_exact": is_exact,
+        "thresholds": pd.DataFrame(thresh_rows),
+        "by_latitude_band": pd.DataFrame(band_rows),
+    }
 
 
 def filter_granules_by_sidecar_cloud_cover(
@@ -210,7 +495,6 @@ def resolve_granule_asset_urls(
         prod, orbit, scene, tile, ts = _extract_granule_join_keys(row["granule"])
         if prod != "L2T_STARS" and orbit is not None and scene is not None:
             key = (orbit, scene, tile, ts)
-            # Prefer L2T_LSTE sidecar when both L2T_LSTE and L3T_JET are present
             if prod == "L2T_LSTE" or key not in json_urls_by_key:
                 json_urls_by_key[key] = row["URL"]
 
