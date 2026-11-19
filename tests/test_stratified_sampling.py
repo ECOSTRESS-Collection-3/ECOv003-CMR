@@ -83,35 +83,48 @@ def test_sample_granule_coordinates_dispersion_and_cropland_balance():
     assert crop_count == 10
 
 
-def test_find_clear_sky_et_granules_uses_regional_boxes_for_large_tile_lists(monkeypatch):
+def test_find_clear_sky_et_granules_uses_jet_first_two_pass_discovery(monkeypatch):
     strat_mod = importlib.import_module("ECOv003_CMR.stratified_sampling")
-    regional_calls = []
+    jet_calls = []
+    companion_calls = []
 
     def mock_entries(**kwargs):
-        regional_calls.append(kwargs)
+        jet_calls.append(kwargs)
+        assert kwargs["concept_ID"] == "C4057232489-LPCLOUD"
+        if "11SLT" in kwargs.get("allowed_tiles", set()):
+            gid = "ECOv003_L3T_JET_44814_001_11SLT_20260601T000306_01"
+            return [{"URL": f"https://example.test/{gid}_PTJPLSMinst.tif", "cloud_cover": 5.0}]
+        return []
+
+    def mock_patterns(**kwargs):
+        companion_calls.append(kwargs)
         cid = kwargs["concept_ID"]
         prod_map = {
-            "C4057232489-LPCLOUD": ("L3T_JET", "PTJPLSMinst"),
             "C3998139651-LPCLOUD": ("L2T_LSTE", "LST"),
             "C4057520953-LPCLOUD": ("L3T_ETAUX", "Ta"),
             "C3998139658-LPCLOUD": ("L2T_STARS", "NDVI"),
         }
         prod, var = prod_map[cid]
         if prod == "L2T_STARS":
+            assert kwargs["granule_patterns"] == ["ECOv003_L2T_STARS_11SLT_20260601_*"]
             gid = "ECOv003_L2T_STARS_11SLT_20260601_01"
         else:
+            assert kwargs["granule_patterns"] == [f"ECOv003_{prod}_44814_001_11SLT_20260601T000306_*"]
             gid = f"ECOv003_{prod}_44814_001_11SLT_20260601T000306_01"
         return [{"URL": f"https://example.test/{gid}_{var}.tif", "cloud_cover": 5.0}]
 
     monkeypatch.setattr(strat_mod, "ECOSTRESS_CMR_search_entries", mock_entries)
+    monkeypatch.setattr(strat_mod, "search_granules_by_name_patterns", mock_patterns)
     tiles = ["11SLT", "11SPS", "52NHN"]
     df = find_clear_sky_et_granules(
         tiles=tiles,
         start_date="2026-06-01",
         end_date="2026-06-02",
         regional_batch_threshold=2,
+        verbose=False,
     )
-    assert len(regional_calls) > 0
+    assert len(jet_calls) > 0
+    assert len(companion_calls) == 3
     assert len(df) == 1
     assert df.iloc[0]["tile"] == "11SLT"
 

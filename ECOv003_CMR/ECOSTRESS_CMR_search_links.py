@@ -1,7 +1,7 @@
 import logging
 import threading
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 import requests
 from datetime import date
 from dateutil import parser
@@ -30,7 +30,7 @@ def _get_cmr_session(session: Optional[requests.Session] = None) -> requests.Ses
 
 def _request_with_backoff(
     url: str,
-    params: Dict[str, Any],
+    params: Union[Dict[str, Any], List[Tuple[str, Any]]],
     headers: Dict[str, str],
     session: Optional[requests.Session] = None,
     max_retries: int = 5,
@@ -58,7 +58,9 @@ def _request_with_backoff(
             if status in _TRANSIENT_CMR_STATUS and attempt < max_retries - 1:
                 retry_after = response.headers.get("Retry-After") if hasattr(response, "headers") else None
                 delay = float(retry_after) if retry_after else backoff_base ** (attempt + 1)
-                logger.warning(f"CMR transient HTTP {status} (attempt {attempt + 1}/{max_retries}); retrying in {delay:.1f}s")
+                logger.warning(
+                    f"CMR transient HTTP {status} (attempt {attempt + 1}/{max_retries}); retrying in {delay:.1f}s"
+                )
                 time.sleep(delay)
                 continue
             response.raise_for_status()
@@ -67,9 +69,106 @@ def _request_with_backoff(
             if attempt >= max_retries - 1:
                 raise
             delay = backoff_base ** (attempt + 1)
-            logger.warning(f"CMR request timeout/connection reset ({exc}); retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
+            logger.warning(
+                f"CMR request timeout/connection reset ({exc}); retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})"
+            )
             time.sleep(delay)
     raise RuntimeError(f"CMR request failed after {max_retries} retries: {url}")
+
+
+def _extract_matching_links(
+    entries: List[Dict[str, Any]],
+    max_cloud_cover: Optional[float] = None,
+    target_tiles: Optional[Set[str]] = None,
+    tif_only: bool = False,
+) -> List[Dict[str, Any]]:
+    allowed_suffixes = (".tif",) if tif_only else (".tif", ".json", ".aux.xml", ".jpeg")
+    records: List[Dict[str, Any]] = []
+    for entry in entries:
+        raw_cc = entry.get("cloud_cover")
+        cloud_cover = float(raw_cc) if raw_cc is not None else None
+        if (
+            max_cloud_cover is not None
+            and cloud_cover is not None
+            and cloud_cover > max_cloud_cover
+        ):
+            continue
+
+        time_start = entry.get("time_start")
+        for link in entry.get("links", []):
+            href = link.get("href")
+            if not (href and href.startswith("https") and href.endswith(allowed_suffixes)):
+                continue
+            if target_tiles is not None:
+                try:
+                    gid = granule_ID_from_filename(href)
+                except Exception as exc:
+                    logger.debug(f"Skipping unparseable CMR asset URL {href}: {exc}")
+                    continue
+                if gid.tile not in target_tiles:
+                    continue
+            records.append(
+                {
+                    "URL": href,
+                    "cloud_cover": cloud_cover,
+                    "acquisition_datetime": time_start,
+                }
+            )
+    return records
+
+
+def search_granules_by_name_patterns(
+    concept_ID: str,
+    granule_patterns: Sequence[str],
+    max_cloud_cover: Optional[float] = None,
+    tif_only: bool = True,
+    CMR_search_URL: str = CMR_SEARCH_URL,
+    session: Optional[requests.Session] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Query CMR granules.json for an exact batch of wildcard readable_granule_name[]
+    patterns (e.g. 'ECOv003_L2T_LSTE_44814_001_52NHN_20260601T000306_*'), avoiding
+    broad spatial sweeps and deep Search-After pagination when companion granules
+    are already known from a primary product search.
+    """
+    if not granule_patterns:
+        return []
+
+    granule_search_URL = f"{CMR_search_URL}granules.json"
+    params: List[Tuple[str, Any]] = [
+        ("concept_id", concept_ID),
+        ("options[readable_granule_name][pattern]", "true"),
+        ("page_size", 2000),
+    ]
+    for pattern in granule_patterns:
+        params.append(("readable_granule_name[]", pattern))
+
+    records: List[Dict[str, Any]] = []
+    headers: Dict[str, str] = {}
+    previous_search_after = None
+
+    while True:
+        response = _request_with_backoff(
+            granule_search_URL, params=params, headers=headers, session=session
+        )
+        entries = response.json().get("feed", {}).get("entry", [])
+        records.extend(
+            _extract_matching_links(
+                entries=entries,
+                max_cloud_cover=max_cloud_cover,
+                target_tiles=None,
+                tif_only=tif_only,
+            )
+        )
+        search_after = response.headers.get("CMR-Search-After")
+        if not search_after or not entries:
+            break
+        if search_after == previous_search_after:
+            raise RuntimeError("CMR repeated a Search-After token; stopping pagination")
+        previous_search_after = search_after
+        headers = {"CMR-Search-After": search_after}
+
+    return records
 
 
 def ECOSTRESS_CMR_search_entries(
@@ -81,6 +180,7 @@ def ECOSTRESS_CMR_search_entries(
     use_tile_bounds: bool = True,
     max_cloud_cover: Optional[float] = None,
     allowed_tiles: Optional[Set[str]] = None,
+    tif_only: bool = False,
     CMR_search_URL: str = CMR_SEARCH_URL,
     session: Optional[requests.Session] = None,
 ) -> List[Dict[str, Any]]:
@@ -123,40 +223,14 @@ def ECOSTRESS_CMR_search_entries(
             granule_search_URL, params=params, headers=headers, session=session
         )
         entries = response.json().get("feed", {}).get("entry", [])
-        for entry in entries:
-            raw_cc = entry.get("cloud_cover")
-            cloud_cover = float(raw_cc) if raw_cc is not None else None
-            if (
-                max_cloud_cover is not None
-                and cloud_cover is not None
-                and cloud_cover > max_cloud_cover
-            ):
-                continue
-
-            time_start = entry.get("time_start")
-            for link in entry.get("links", []):
-                href = link.get("href")
-                if not (
-                    href
-                    and href.startswith("https")
-                    and href.endswith((".tif", ".json", ".aux.xml", ".jpeg"))
-                ):
-                    continue
-                if target_tiles is not None:
-                    try:
-                        gid = granule_ID_from_filename(href)
-                    except Exception as exc:
-                        logger.debug(f"Skipping unparseable CMR asset URL {href}: {exc}")
-                        continue
-                    if gid.tile not in target_tiles:
-                        continue
-                records.append(
-                    {
-                        "URL": href,
-                        "cloud_cover": cloud_cover,
-                        "acquisition_datetime": time_start,
-                    }
-                )
+        records.extend(
+            _extract_matching_links(
+                entries=entries,
+                max_cloud_cover=max_cloud_cover,
+                target_tiles=target_tiles,
+                tif_only=tif_only,
+            )
+        )
 
         search_after = response.headers.get("CMR-Search-After")
         if not search_after or not entries:

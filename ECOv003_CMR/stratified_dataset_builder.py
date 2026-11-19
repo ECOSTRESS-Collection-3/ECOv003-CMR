@@ -233,6 +233,7 @@ def build_stratified_dataset(
             end_date=end_date,
             max_cloud_cover=max_cloud_cover,
             extra_products=extra_products,
+            min_granules_floor=min_granules_floor,
             session=session,
             cmr_workers=max(1, min(6, max_workers)),
             cmr_cache_dir=os.path.join(output_dir, "cmr_task_cache"),
