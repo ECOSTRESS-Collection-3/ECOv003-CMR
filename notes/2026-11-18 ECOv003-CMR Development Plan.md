@@ -198,4 +198,3 @@ To support multi-million-sample global campaigns reliably without triggering ups
   - Consolidate duplicate `product_name_from_granule_ID()` in `granule_ID.py` into `product_name_from_filename()`.
   - Emit `warnings.warn(..., DeprecationWarning)` when the legacy misspelled `aquisition_date` argument is passed in `download_ECOSTRESS_granule()` and `download_ECOSTRESS_granule_files()`.
   - Wrap `importlib.metadata.version("ECOv003-CMR")` in `version.py` with a `PackageNotFoundError` fallback for uninstalled source checkouts.
-````[cite: 1]
