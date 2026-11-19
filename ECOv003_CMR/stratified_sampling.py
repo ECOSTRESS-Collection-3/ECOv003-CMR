@@ -27,15 +27,19 @@ def find_clear_sky_et_granules(
     start_date: Union[date, str],
     end_date: Union[date, str],
     max_cloud_cover: Optional[float] = 20.0,
+    extra_products: Optional[List[str]] = None,
     CMR_search_URL: str = CMR_SEARCH_URL,
     session: Optional[requests.Session] = None,
 ) -> pd.DataFrame:
     """
     Verify candidate daytime clear-sky L3T_JET overpasses that have matching
     (orbit, scene, tile, timestamp) L2T_LSTE and L3T_ETAUX granules plus a
-    same-date (tile, YYYYMMDD) L2T_STARS granule.
+    same-date (tile, YYYYMMDD) L2T_STARS granule, caching all variable GeoTIFF URLs.
     """
     required_products = ["L3T_JET", "L2T_LSTE", "L3T_ETAUX", "L2T_STARS"]
+    if extra_products:
+        required_products = list(dict.fromkeys(required_products + list(extra_products)))
+
     listing = ECOSTRESS_CMR_search(
         product=required_products,
         tile=tiles,
@@ -54,15 +58,23 @@ def find_clear_sky_et_granules(
     instantaneous_keys: Dict[str, set] = {"L3T_JET": set(), "L2T_LSTE": set(), "L3T_ETAUX": set()}
     stars_keys: set = set()
     jet_granule_meta: Dict[Tuple[int, int, str, str], Dict[str, Any]] = {}
+    overpass_urls: Dict[Tuple[int, int, str, str], Dict[str, str]] = {}
+    stars_urls: Dict[Tuple[str, str], Dict[str, str]] = {}
 
     for _, row in tifs.iterrows():
         granule = row["granule"]
+        variable = row["variable"]
+        url = row["URL"]
         prod, orbit, scene, tile, ts = _extract_granule_join_keys(granule)
         if prod == "L2T_STARS":
-            stars_keys.add((tile, ts[:8]))
-        elif prod in instantaneous_keys:
+            s_key = (tile, ts[:8])
+            stars_keys.add(s_key)
+            stars_urls.setdefault(s_key, {})[variable] = url
+        else:
             key = (orbit, scene, tile, ts)
-            instantaneous_keys[prod].add(key)
+            overpass_urls.setdefault(key, {})[variable] = url
+            if prod in instantaneous_keys:
+                instantaneous_keys[prod].add(key)
             if prod == "L3T_JET" and key not in jet_granule_meta:
                 jet_granule_meta[key] = {
                     "granule": granule,
@@ -78,13 +90,17 @@ def find_clear_sky_et_granules(
     for key, meta in jet_granule_meta.items():
         _, _, tile, ts = key
         date_str = ts[:8]
+        s_key = (tile, date_str)
         if (
             key in instantaneous_keys["L2T_LSTE"]
             and key in instantaneous_keys["L3T_ETAUX"]
-            and (tile, date_str) in stars_keys
+            and s_key in stars_keys
         ):
             month = int(date_str[4:6])
             meta["quarter"] = (month - 1) // 3 + 1
+            merged_urls = dict(stars_urls.get(s_key, {}))
+            merged_urls.update(overpass_urls.get(key, {}))
+            meta["variable_urls"] = merged_urls
             complete_rows.append(meta)
 
     return pd.DataFrame(complete_rows)
@@ -161,34 +177,44 @@ def compute_per_granule_quota(
 
 
 def extract_valid_swath_mask(
-    cloud_url: str,
+    cloud_url: Optional[str] = None,
     water_url: Optional[str] = None,
+    primary_data_url: Optional[str] = None,
     overview_level: Optional[int] = None,
 ) -> Tuple[np.ndarray, rasterio.Affine, CRS]:
     """
-    Read cloud (and optional water) masks from a COG (optionally using low-res
-    overviews) to identify valid clear-sky land pixels inside the swath footprint.
+    Identify valid clear-sky land pixels inside the swath footprint using a single
+    pre-masked primary retrieval raster (e.g., L3T_JET PTJPLSMinst) when provided,
+    or explicit cloud/water mask COGs.
     """
-    with rasterio.open(cloud_url) as cloud_src:
-        overviews = cloud_src.overviews(1)
+    target_url = primary_data_url or cloud_url
+    if not target_url:
+        raise ValueError("Either 'primary_data_url' or 'cloud_url' must be provided")
+
+    with rasterio.open(target_url) as src:
+        overviews = src.overviews(1)
         if overview_level is not None and overviews:
             scale = overviews[min(overview_level, len(overviews) - 1)]
             out_shape = (
-                max(1, cloud_src.height // scale),
-                max(1, cloud_src.width // scale),
+                max(1, src.height // scale),
+                max(1, src.width // scale),
             )
-            cloud_arr = cloud_src.read(1, out_shape=out_shape, masked=True)
-            affine = cloud_src.transform * rasterio.Affine.scale(
-                cloud_src.width / out_shape[1],
-                cloud_src.height / out_shape[0],
+            arr = src.read(1, out_shape=out_shape, masked=True)
+            affine = src.transform * rasterio.Affine.scale(
+                src.width / out_shape[1],
+                src.height / out_shape[0],
             )
         else:
-            cloud_arr = cloud_src.read(1, masked=True)
-            affine = cloud_src.transform
-        crs = cloud_src.crs
+            arr = src.read(1, masked=True)
+            affine = src.transform
+        crs = src.crs
 
-    valid_mask = (~np.ma.getmaskarray(cloud_arr)) & (np.ma.filled(cloud_arr, 1) == 0)
+    if primary_data_url is not None:
+        filled = np.ma.filled(arr, np.nan)
+        valid_mask = (~np.ma.getmaskarray(arr)) & np.isfinite(filled)
+        return valid_mask, affine, crs
 
+    valid_mask = (~np.ma.getmaskarray(arr)) & (np.ma.filled(arr, 1) == 0)
     if water_url is not None:
         with rasterio.open(water_url) as water_src:
             water_arr = water_src.read(1, out_shape=valid_mask.shape, masked=True)

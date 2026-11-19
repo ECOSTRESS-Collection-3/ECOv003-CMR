@@ -129,6 +129,43 @@ def _overpass_key(granule: str) -> Optional[Tuple[str, str, str, str]]:
     return None
 
 
+def _sample_single_variable_url(
+    variable: str,
+    url: str,
+    lons: List[float],
+    lats: List[float],
+    session: Optional[requests.Session],
+    use_vsicurl: bool,
+) -> Tuple[str, List[Optional[float]]]:
+    extracted: Optional[List[Optional[float]]] = None
+    if use_vsicurl:
+        try:
+            with rasterio.open(url) as src:
+                xs, ys = transform(CRS.from_epsg(4326), src.crs, lons, lats)
+                sampled = list(src.sample(zip(xs, ys), masked=True))
+                extracted = [
+                    None if np.ma.is_masked(val[0]) or np.isnan(float(val[0])) else float(val[0])
+                    for val in sampled
+                ]
+        except Exception as exc:
+            logger.debug(f"/vsicurl/ read failed for {url}, falling back to MemoryFile: {exc}")
+
+    if extracted is None:
+        if session is None:
+            session = setup_earthdata_session()
+        resp = session.get(url, allow_redirects=True, timeout=90)
+        resp.raise_for_status()
+        with MemoryFile(resp.content) as memfile, memfile.open() as src:
+            xs, ys = transform(CRS.from_epsg(4326), src.crs, lons, lats)
+            sampled = list(src.sample(zip(xs, ys), masked=True))
+            extracted = [
+                None if np.ma.is_masked(val[0]) or np.isnan(float(val[0])) else float(val[0])
+                for val in sampled
+            ]
+
+    return variable, extracted
+
+
 def sample_points_from_granule(
     variable_urls: Dict[str, str],
     coords: List[Tuple[float, float]],
@@ -136,11 +173,12 @@ def sample_points_from_granule(
     session: Optional[requests.Session] = None,
     use_vsicurl: bool = True,
     metadata_rows: Optional[List[Dict[str, Any]]] = None,
+    max_workers: int = 8,
 ) -> pd.DataFrame:
     """
-    Open each variable GeoTIFF once and extract all K coordinates in a single
-    vectorized src.sample(proj_coords, masked=True) call over /vsicurl/
-    (falling back to MemoryFile if needed).
+    Open each variable GeoTIFF once (concurrently across variables) and extract
+    all K coordinates in a single vectorized src.sample(proj_coords, masked=True)
+    call over /vsicurl/ (falling back to MemoryFile if needed).
     """
     if not coords:
         return pd.DataFrame()
@@ -158,41 +196,31 @@ def sample_points_from_granule(
             rec.update(metadata_rows[i])
         records.append(rec)
 
-    requested_vars = list(dict.fromkeys(LAYER_MAPPING[layer][1] for layer in layers))
+    requested_vars = [
+        v for v in dict.fromkeys(LAYER_MAPPING[layer][1] for layer in layers)
+        if variable_urls.get(v)
+    ]
 
-    for variable in requested_vars:
-        url = variable_urls.get(variable)
-        if not url:
-            continue
-
-        extracted: Optional[List[Optional[float]]] = None
-        if use_vsicurl:
-            try:
-                with rasterio.open(url) as src:
-                    xs, ys = transform(CRS.from_epsg(4326), src.crs, lons, lats)
-                    sampled = list(src.sample(zip(xs, ys), masked=True))
-                    extracted = [
-                        None if np.ma.is_masked(val[0]) or np.isnan(float(val[0])) else float(val[0])
-                        for val in sampled
-                    ]
-            except Exception as exc:
-                logger.debug(f"/vsicurl/ read failed for {url}, falling back to MemoryFile: {exc}")
-
-        if extracted is None:
-            if session is None:
-                session = setup_earthdata_session()
-            resp = session.get(url, allow_redirects=True, timeout=90)
-            resp.raise_for_status()
-            with MemoryFile(resp.content) as memfile, memfile.open() as src:
-                xs, ys = transform(CRS.from_epsg(4326), src.crs, lons, lats)
-                sampled = list(src.sample(zip(xs, ys), masked=True))
-                extracted = [
-                    None if np.ma.is_masked(val[0]) or np.isnan(float(val[0])) else float(val[0])
-                    for val in sampled
-                ]
-
-        for i, val in enumerate(extracted):
-            records[i][variable] = val
+    if max_workers > 1 and len(requested_vars) > 1:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(requested_vars))) as executor:
+            futures = [
+                executor.submit(
+                    _sample_single_variable_url,
+                    var, variable_urls[var], lons, lats, session, use_vsicurl
+                )
+                for var in requested_vars
+            ]
+            for future in as_completed(futures):
+                variable, extracted = future.result()
+                for i, val in enumerate(extracted):
+                    records[i][variable] = val
+    else:
+        for var in requested_vars:
+            variable, extracted = _sample_single_variable_url(
+                var, variable_urls[var], lons, lats, session, use_vsicurl
+            )
+            for i, val in enumerate(extracted):
+                records[i][variable] = val
 
     df = pd.DataFrame(records)
     return _apply_layer_names(df, layers)
