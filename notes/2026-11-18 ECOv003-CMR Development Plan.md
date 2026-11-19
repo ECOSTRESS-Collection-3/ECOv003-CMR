@@ -1,9 +1,10 @@
-# ECOv003-CMR Development Plan: From Collection 3 Migration (`v1.1.1`) to Global 1M-Sample Stratified Point-Query Pipeline (`v1.2.0`)
+# ECOv003-CMR Development Plan: From Collection 3 Migration (`v1.1.1`) to Global 1M-Sample Stratified Point-Query Pipeline (`v1.2.0` & `v1.3.0`)
 
 **Prepared:** 2026-11-18  
 **Repository:** `ECOSTRESS-Collection-3/ECOv003-CMR`  
 **Previous Version:** `v1.1.1`  
 **Current Version:** `v1.2.0` (Implemented & Benchmarked on `point_query`)  
+**Next Target Version:** `v1.3.0` (Large-Volume & Global Production Scaling)
 
 ---
 
@@ -14,6 +15,8 @@
 In **`v1.2.0`**, `ECOv003-CMR` has been extended into a **general-purpose, granule-centric, spatially and seasonally stratified point-sampling engine** (`build_stratified_dataset()`), originally motivated by generating a **~1,000,000-sample non-tower ECOSTRESS training dataset** for uncertainty quantification (UQ) via transport maps, spatial downscaling of relative humidity (`RH`), and temporal upscaling of evapotranspiration (`ET`).
 
 Through empirical profiling and iterative architectural optimization against live LP DAAC Earthdata Cloud granules, per-granule extraction latency across 16 science/UQ layers was reduced from **56.71s** to **13.00s** ($4.4\times$ speedup), bringing the amortized global 1,000,000-sample runtime down from **3.98 hours** to **56.77 minutes** on 16 workers with **100.0% layer completeness**.
+
+For **`v1.3.0`**, remaining development focuses squarely on **hardening and scaling the point sampler for large-volume, multi-million-sample production campaigns**—specifically eliminating NASA CMR per-tile query bottlenecks, bounding concurrent LP DAAC CloudFront/S3 HTTP streams, refreshing Earthdata URS cookies across multi-hour runs, caching discovered granule catalogs, and adding built-in cropland/land-cover stratification.
 
 ---
 
@@ -128,9 +131,8 @@ Because GDAL `/vsicurl/` fetches compressed $512 \times 512$ internal GeoTIFF ti
 
 ---
 
-## 6. Completed `v1.2.0` Checklist & `v1.3.0` Next Steps
+## 6. Completed `v1.2.0` Checklist
 
-### Completed in `v1.2.0`
 - [x] **Global MGRS Tile Catalog (`ECOv003_CMR/tile_catalog.py`):** Implemented `list_ecostress_land_tiles(min_lat=-54.0, max_lat=54.0)` with cached Natural Earth landmass geometry.
 - [x] **Full-Bounds CMR Queries & Backoff (`ECOSTRESS_CMR_search_links.py`, `ECOSTRESS_CMR_search.py`, `interpret_ECOSTRESS_URLs.py`):** Enabled WGS84 tile bounding-box queries (`use_tile_bounds=True`), exact `_<TILE>_` filtering, HTTP `429`/`503` backoff, `cloud_cover` metadata propagation, and `fetch_granule_metadata()`.
 - [x] **Stratified Granule & Pixel Selection (`ECOv003_CMR/stratified_sampling.py`):** Implemented `find_clear_sky_et_granules()` (with URL caching), `select_stratified_granules()`, `compute_per_granule_quota()`, `extract_valid_swath_mask()` (with `primary_data_url`), and `sample_granule_coordinates()` (`"stratified_grid"`, `"uniform"`, and cropland weighting).
@@ -138,7 +140,40 @@ Because GDAL `/vsicurl/` fetches compressed $512 \times 512$ internal GeoTIFF ti
 - [x] **General Stratified Dataset Builder & Benchmarks (`ECOv003_CMR/stratified_dataset_builder.py`):** Implemented `build_stratified_dataset()` with Parquet/CSV checkpointing, `completed_granules.txt` manifest resuming, stage timings, and 1M runtime extrapolation.
 - [x] **Packaging, Tests & Documentation:** Bumped `pyproject.toml` to `1.2.0` with `pyarrow`, added `tests/test_stratified_sampling.py` and `tests/test_live_integration.py`, added `make test-sampler`, and updated `README.md` and `examples/stratified_sampling_demo.py`.
 
-### Planned Enhancements for `v1.3.0`
-- [ ] **Regional Bounding-Box CMR Batching:** Group global land tiles into ~60 regional spatial chunks during `find_clear_sky_et_granules()` so global 5,000-tile CMR discovery completes in ~2 minutes rather than issuing 5,000 individual tile requests.
-- [ ] **Built-In Land-Cover Mask Provider:** Add an optional on-demand ESA WorldCover / MODIS MCD12Q1 cropland mask loader so `cropland_fraction_target` can be passed directly to `build_stratified_dataset()`.
-- [ ] **Upstream `ECOv003-granules` Consolidation:** Migrate `_Collection3GranuleMixin` fixes into `ECOv003-granules` upstream and deprecate `granule_compatibility.py`.
+---
+
+## 7. Roadmap for `v1.3.0`: Scaling the Point Sampler to Large-Volume Datasets
+
+To support multi-million-sample global campaigns reliably without triggering upstream NASA CMR rate limits, CloudFront connection throttling, or session expiration, `v1.3.0` focuses on **large-volume throughput, resilience, and scale**:
+
+### 7.1 Regional Bounding-Box & Temporal-Chunked CMR Discovery (`ECOv003_CMR/stratified_sampling.py`)
+- **Problem:** Global MGRS discovery (`list_ecostress_land_tiles()`) returns ~14,000 land tiles; querying `4 products × 14,000 tiles` issues ~56,000 individual CMR requests, triggering HTTP `429`/`503` throttling and adding hours of search overhead.
+- **Target Implementation:**
+  - Automatically cluster target tile sets (`len(tiles) > 25`) into regional WGS84 bounding boxes (e.g., $30^\circ \times 30^\circ$ or continental regions) and issue bulk `ECOSTRESS_CMR_search_entries(bounding_box=...)` queries partitioned into quarterly/semi-annual temporal windows (`page_size=2000`).
+  - Filter returned entries locally against the target MGRS tile set, reducing global CMR API calls by $>100\times$ (from ~56,000 down to ~300–500 requests).
+
+### 7.2 Persistent Candidate Granule Catalog Caching (`ECOv003_CMR/stratified_dataset_builder.py`)
+- **Problem:** Tuning `target_total_samples`, `min_granules_floor`, or `dispersion_strategy` across large geographic domains currently requires re-querying CMR from scratch.
+- **Target Implementation:**
+  - Persist the verified multi-product candidate catalog (`candidate_granules.parquet`, including serialized `variable_urls`) inside `output_dir` (or a user-specified `catalog_path`).
+  - Support `refresh_catalog: bool = False` so subsequent runs or quota adjustments load the catalog offline in $<1\text{s}$.
+
+### 7.3 Bounded HTTP Stream Concurrency & Adaptive Backoff (`ECOv003_CMR/stratified_dataset_builder.py` & `point_sampling.py`)
+- **Problem:** Nested thread pools (`max_workers` outer granule workers $\times$ `max_workers` inner layer workers) can spawn $>100$ concurrent HTTPS connections, risking LP DAAC CloudFront per-IP burst throttling (`429`/`503`) and OS file-descriptor exhaustion (`ulimit -n`).
+- **Target Implementation:**
+  - Add explicit `layer_workers` and `max_concurrent_streams` (defaulting to `32–48` total active HTTP streams) using a shared semaphore or bounded worker ratio (`max_workers=4`, `layer_workers=8`).
+  - Add jittered exponential backoff inside `/vsicurl/` and `MemoryFile` reads on transient HTTP `429`/`502`/`503`/`504` errors.
+
+### 7.4 Automatic URS Cookie Refresh via Batched Execution Windows (`ECOv003_CMR/stratified_dataset_builder.py`)
+- **Problem:** Earthdata URS session cookies and redirected AWS S3 presigned URLs expire after ~15–60 minutes, which can degrade `/vsicurl/` cache hits during multi-hour global extractions.
+- **Target Implementation:**
+  - Partition `pending` granules into bounded execution batches (`batch_size: int = 250`, ~50,000–62,500 samples per batch) and re-enter a fresh `configure_gdal_earthdata_env()` context with cookie pre-warming at each batch boundary.
+
+### 7.5 Streaming Parquet Aggregation & Memory-Safe Diagnostics (`ECOv003_CMR/stratified_dataset_builder.py` & `point_sampling.py`)
+- **Problem:** Reading all partitioned Parquet files into a single `pd.DataFrame` via `pd.concat` at the end of a run scales linearly in RAM for multi-million-sample (10M+) datasets.
+- **Target Implementation:**
+  - Compute `summarize_point_samples()` incrementally using `pyarrow.parquet` column metadata and streaming batch accumulators so memory usage remains constant ($<200\text{ MB}$) regardless of whether the dataset contains 1M or 50M rows.
+
+### 7.6 On-Demand Land-Cover & Cropland Stratification Provider (`ECOv003_CMR/stratified_sampling.py`)
+- **Target Implementation:**
+  - Add an optional on-demand cropland mask provider (e.g., ESA WorldCover / MODIS MCD12Q1) with regional/batch-level quota tracking so `cropland_fraction_target` can be enforced seamlessly in large-scale `build_stratified_dataset()` runs without failing on homogeneous forest or desert tiles.
