@@ -174,9 +174,10 @@ def build_stratified_dataset(
 ) -> Dict[str, Any]:
     """
     Build a spatially and seasonally stratified ECOSTRESS Collection 3 point-sample
-    dataset with UMM-JSON catalog discovery, lazy post-stratification asset URL
-    resolution, bounded HTTP stream concurrency, synchronous URS cookie refresh
-    across batches, adaptive quota refills, and O(1)-memory Parquet diagnostics.
+    dataset with CMR CSV catalog discovery, lazy post-stratification asset URL
+    & sidecar QAPercentCloudCover resolution, bounded HTTP stream concurrency,
+    synchronous URS cookie refresh across batches, adaptive quota refills, and
+    O(1)-memory Parquet diagnostics.
     """
     t_start = time.perf_counter()
     timings: Dict[str, float] = {}
@@ -237,7 +238,7 @@ def build_stratified_dataset(
             min_granules_floor=min_granules_floor,
             resolve_urls=False,
             session=session,
-            cmr_workers=max(1, min(8, max_workers)),
+            cmr_workers=max(1, min(6, max_workers)),
             verbose=verbose,
         )
         if not candidate_granules.empty:
@@ -267,7 +268,7 @@ def build_stratified_dataset(
         _log(f"[4/6] No tiles met min_granules_floor={min_granules_floor}.")
         return {"total_samples": 0, "selected_granules": 0, "n_cap": 0, "timings": timings}
 
-    # Resolve GeoTIFF asset URLs lazily only for selected granules (if not already resolved)
+    # Resolve GeoTIFF asset URLs & sidecar QAPercentCloudCover lazily for selected granules
     if "variable_urls" not in selected_granules.columns or not selected_granules["variable_urls"].apply(
         lambda d: isinstance(d, dict) and len(d) > 0
     ).all():
@@ -276,10 +277,10 @@ def build_stratified_dataset(
             extra_products=extra_products,
             max_cloud_cover=max_cloud_cover,
             session=session,
-            cmr_workers=max(1, min(8, max_workers)),
+            cmr_workers=max(1, min(6, max_workers)),
             verbose=verbose,
         )
-        # Backfill any tile that lost a granule due to a missing companion product
+        # Backfill any tile that lost a granule due to sidecar cloud cover or a missing companion
         if len(resolved_selected) < len(selected_granules):
             selected_set = set(selected_granules["granule"])
             remaining_candidates = candidate_granules[
@@ -294,7 +295,7 @@ def build_stratified_dataset(
             if deficits and not remaining_candidates.empty:
                 backfill_rows = []
                 for t, need in deficits.items():
-                    t_pool = remaining_candidates[remaining_candidates["tile"] == t].head(need * 2)
+                    t_pool = remaining_candidates[remaining_candidates["tile"] == t].head(need * 3)
                     if not t_pool.empty:
                         backfill_rows.append(t_pool)
                 if backfill_rows:
@@ -303,7 +304,7 @@ def build_stratified_dataset(
                         extra_products=extra_products,
                         max_cloud_cover=max_cloud_cover,
                         session=session,
-                        cmr_workers=max(1, min(8, max_workers)),
+                        cmr_workers=max(1, min(6, max_workers)),
                         verbose=False,
                     )
                     if not backfill_resolved.empty:
@@ -316,7 +317,7 @@ def build_stratified_dataset(
         selected_granules = resolved_selected
 
     if selected_granules.empty:
-        _log("[4/6] No complete multi-product granules remained after companion URL resolution.")
+        _log("[4/6] No complete clear-sky multi-product granules remained after URL & sidecar resolution.")
         return {"total_samples": 0, "selected_granules": 0, "n_cap": 0, "timings": timings}
 
     quota_k, candidate_n = compute_per_granule_quota(

@@ -15,11 +15,11 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 
 from .ECOSTRESS_CMR_search import ECOSTRESS_CMR_search
 from .ECOSTRESS_CMR_search_links import (
-    search_granule_catalog_umm,
+    search_granule_catalog_csv,
     search_granules_by_name_patterns,
 )
 from .constants import CMR_SEARCH_URL, CONCEPT_IDS
-from .interpret_ECOSTRESS_URLs import interpret_ECOSTRESS_URLs
+from .interpret_ECOSTRESS_URLs import fetch_granule_metadata, interpret_ECOSTRESS_URLs
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,72 @@ def _batched(items: Sequence[Any], batch_size: int) -> List[Sequence[Any]]:
     return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
 
 
+def filter_granules_by_sidecar_cloud_cover(
+    granules_df: pd.DataFrame,
+    json_urls_by_key: Dict[Tuple[int, int, str, str], str],
+    max_cloud_cover: Optional[float],
+    session: Optional[requests.Session] = None,
+    max_workers: int = 32,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Fetch per-granule .json metadata sidecars concurrently to read
+    ProductMetadata.QAPercentCloudCover and filter scenes exceeding max_cloud_cover.
+    """
+    if granules_df.empty or max_cloud_cover is None:
+        return granules_df.copy()
+
+    tasks: List[Tuple[int, str]] = []
+    for idx, row in granules_df.iterrows():
+        key = (int(row["orbit"]), int(row["scene"]), str(row["tile"]), str(row["timestamp"]))
+        json_url = json_urls_by_key.get(key)
+        if json_url:
+            tasks.append((idx, json_url))
+
+    if not tasks:
+        return granules_df.copy()
+
+    def _check_one(item: Tuple[int, str]) -> Tuple[int, Optional[float]]:
+        row_idx, url = item
+        try:
+            meta = fetch_granule_metadata(url, session=session, timeout=30)
+            return row_idx, meta.get("cloud_cover")
+        except Exception as exc:
+            logger.debug(f"Failed to read granule metadata sidecar {url}: {exc}")
+            return row_idx, None
+
+    cc_by_idx: Dict[int, Optional[float]] = {}
+    with logging_redirect_tqdm(), ThreadPoolExecutor(
+        max_workers=max(1, min(max_workers, len(tasks)))
+    ) as executor:
+        futures = [executor.submit(_check_one, t) for t in tasks]
+        with tqdm(
+            total=len(tasks),
+            desc="Checking sidecar cloud %",
+            unit="granule",
+            dynamic_ncols=True,
+            disable=not verbose,
+        ) as pbar:
+            for future in as_completed(futures):
+                row_idx, cc_val = future.result()
+                cc_by_idx[row_idx] = cc_val
+                pbar.update(1)
+
+    kept_rows = []
+    for idx, row in granules_df.iterrows():
+        cc_val = cc_by_idx.get(idx, row.get("cloud_cover"))
+        if cc_val is not None and pd.notna(cc_val) and float(cc_val) > max_cloud_cover:
+            continue
+        rec = row.to_dict()
+        if cc_val is not None and pd.notna(cc_val):
+            rec["cloud_cover"] = float(cc_val)
+        kept_rows.append(rec)
+
+    if not kept_rows:
+        return pd.DataFrame(columns=granules_df.columns)
+    return pd.DataFrame(kept_rows).reset_index(drop=True)
+
+
 def resolve_granule_asset_urls(
     granules_df: pd.DataFrame,
     extra_products: Optional[List[str]] = None,
@@ -44,13 +110,15 @@ def resolve_granule_asset_urls(
     CMR_search_URL: str = CMR_SEARCH_URL,
     session: Optional[requests.Session] = None,
     cmr_workers: int = 8,
+    sidecar_workers: int = 32,
     pattern_batch_size: int = 150,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """
     Resolve GeoTIFF asset URLs across L3T_JET, L2T_LSTE, L3T_ETAUX, L2T_STARS
     (and any extra_products) strictly for the supplied candidate/selected rows
-    using exact wildcard readable_granule_name[] batches.
+    using exact wildcard readable_granule_name[] batches, and enforce
+    max_cloud_cover via per-granule .json sidecars (ProductMetadata.QAPercentCloudCover).
     """
     if granules_df.empty:
         return granules_df.copy()
@@ -86,19 +154,22 @@ def resolve_granule_asset_urls(
 
     if verbose:
         logger.info(
-            f"Resolving GeoTIFF asset URLs for {len(granules_df):,} granules across "
+            f"Resolving GeoTIFF & sidecar URLs for {len(granules_df):,} granules across "
             f"{len(all_products)} products ({len(tasks)} pattern batches, workers={min(cmr_workers, max(1, len(tasks)))})..."
         )
 
+    need_sidecars = max_cloud_cover is not None
+
     def _run_batch(task: Tuple[str, List[str]]) -> pd.DataFrame:
         prod, patterns = task
-        # CloudCover in CMR is populated on L2T_LSTE (null on L3T_JET/L3T_ETAUX/L2T_STARS)
-        cc_filter = max_cloud_cover if prod == "L2T_LSTE" else None
+        suffixes = (".tif", ".json") if (need_sidecars and prod in ("L2T_LSTE", "L3T_JET")) else (".tif",)
+        # Do NOT pass max_cloud_cover to CMR: CloudCover is null on all C3 granules in CMR
         entries = search_granules_by_name_patterns(
             concept_ID=CONCEPT_IDS[prod],
             granule_patterns=patterns,
-            max_cloud_cover=cc_filter,
-            tif_only=True,
+            max_cloud_cover=None,
+            tif_only=not need_sidecars,
+            allowed_suffixes=suffixes,
             CMR_search_URL=CMR_search_URL,
             session=session,
         )
@@ -130,7 +201,19 @@ def resolve_granule_asset_urls(
     if not frames:
         return pd.DataFrame()
 
-    tifs = pd.concat(frames, ignore_index=True)
+    assets = pd.concat(frames, ignore_index=True)
+    tifs = assets[assets["type"] == "GeoTIFF Data"]
+    jsons = assets[assets["type"] == "JSON Metadata"]
+
+    json_urls_by_key: Dict[Tuple[int, int, str, str], str] = {}
+    for _, row in jsons.iterrows():
+        prod, orbit, scene, tile, ts = _extract_granule_join_keys(row["granule"])
+        if prod != "L2T_STARS" and orbit is not None and scene is not None:
+            key = (orbit, scene, tile, ts)
+            # Prefer L2T_LSTE sidecar when both L2T_LSTE and L3T_JET are present
+            if prod == "L2T_LSTE" or key not in json_urls_by_key:
+                json_urls_by_key[key] = row["URL"]
+
     instantaneous_keys: Dict[str, Set[Tuple[int, int, str, str]]] = {
         prod: set() for prod in all_products if prod != "L2T_STARS"
     }
@@ -165,7 +248,18 @@ def resolve_granule_asset_urls(
             rec["variable_urls"] = merged_urls
             resolved_rows.append(rec)
 
-    return pd.DataFrame(resolved_rows)
+    resolved_df = pd.DataFrame(resolved_rows)
+    if resolved_df.empty or max_cloud_cover is None:
+        return resolved_df
+
+    return filter_granules_by_sidecar_cloud_cover(
+        granules_df=resolved_df,
+        json_urls_by_key=json_urls_by_key,
+        max_cloud_cover=max_cloud_cover,
+        session=session,
+        max_workers=sidecar_workers,
+        verbose=verbose,
+    )
 
 
 def find_clear_sky_et_granules(
@@ -179,7 +273,7 @@ def find_clear_sky_et_granules(
     CMR_search_URL: str = CMR_SEARCH_URL,
     session: Optional[requests.Session] = None,
     regional_batch_threshold: int = 25,
-    cmr_workers: int = 8,
+    cmr_workers: int = 6,
     cmr_cache_dir: Optional[str] = None,
     pattern_batch_size: int = 150,
     verbose: bool = True,
@@ -187,13 +281,12 @@ def find_clear_sky_et_granules(
     """
     Fast ET-first discovery for complete multi-product ECOSTRESS overpasses:
       - For small tile subsets (<= regional_batch_threshold): queries CMR directly
-        per tile and resolves full GeoTIFF URLs.
+        per tile and filters by sidecar QAPercentCloudCover when max_cloud_cover is set.
       - For large/global tile sets (> regional_batch_threshold): uses NASA CMR's
-        lightweight UMM-JSON endpoint (granules.umm_json) across global temporal
-        chunks to index L3T_JET and server-side cloud-filtered L2T_LSTE in seconds
-        with zero spatial-overlap duplicates, prunes tiles below min_granules_floor,
-        and resolves GeoTIFF URLs via wildcard readable_granule_name[] batches only
-        when resolve_urls=True.
+        flat granules.csv endpoint across 5-day parallel temporal windows (~97%
+        smaller payloads, zero spatial-overlap duplicates) to index L3T_JET,
+        prunes tiles below min_granules_floor, and resolves GeoTIFF URLs + sidecar
+        cloud cover via wildcard readable_granule_name[] batches only when resolve_urls=True.
     """
     companion_products = ["L2T_LSTE", "L3T_ETAUX", "L2T_STARS"]
     if extra_products:
@@ -212,13 +305,25 @@ def find_clear_sky_et_granules(
             tile=unique_tiles,
             start_date=start_date,
             end_date=end_date,
-            max_cloud_cover=max_cloud_cover,
+            max_cloud_cover=None,
             CMR_search_URL=CMR_search_URL,
             session=session,
         )
-        tifs = listing[listing["type"] == "GeoTIFF Data"].copy() if not listing.empty else pd.DataFrame()
+        if listing.empty:
+            return pd.DataFrame()
+
+        tifs = listing[listing["type"] == "GeoTIFF Data"].copy()
+        jsons = listing[listing["type"] == "JSON Metadata"].copy()
         if tifs.empty:
             return pd.DataFrame()
+
+        json_urls_by_key: Dict[Tuple[int, int, str, str], str] = {}
+        for _, row in jsons.iterrows():
+            prod, orbit, scene, tile, ts = _extract_granule_join_keys(row["granule"])
+            if prod != "L2T_STARS" and orbit is not None and scene is not None:
+                key = (orbit, scene, tile, ts)
+                if prod == "L2T_LSTE" or key not in json_urls_by_key:
+                    json_urls_by_key[key] = row["URL"]
 
         instantaneous_keys: Dict[str, set] = {
             prod: set() for prod in required_products if prod != "L2T_STARS"
@@ -267,84 +372,53 @@ def find_clear_sky_et_granules(
                 meta["variable_urls"] = merged_urls
                 complete_rows.append(meta)
 
-        return pd.DataFrame(complete_rows)
+        result_df = pd.DataFrame(complete_rows)
+        if result_df.empty or max_cloud_cover is None:
+            return result_df
+        return filter_granules_by_sidecar_cloud_cover(
+            granules_df=result_df,
+            json_urls_by_key=json_urls_by_key,
+            max_cloud_cover=max_cloud_cover,
+            session=session,
+            verbose=verbose,
+        )
 
-    # --- Large / Global UMM-JSON Fast Path ---
+    # --- Large / Global CMR CSV Fast Path ---
     allowed_tile_set = set(unique_tiles)
     if verbose:
         logger.info(
-            f"UMM-JSON Pass 1/2 [L3T_JET]: indexing global ET granules across "
+            f"CMR CSV Discovery [L3T_JET]: indexing global ET granules across "
             f"{len(allowed_tile_set):,} target tiles ({start_date} to {end_date})..."
         )
-    jet_df = search_granule_catalog_umm(
+    jet_df = search_granule_catalog_csv(
         concept_ID=CONCEPT_IDS["L3T_JET"],
         start_date=start_date,
         end_date=end_date,
-        max_cloud_cover=None,  # CloudCover is null on L3T_JET in CMR; filtered via L2T_LSTE below
         allowed_tiles=allowed_tile_set,
-        chunk_days=31,
+        chunk_days=5,
         max_workers=cmr_workers,
         CMR_search_URL=CMR_search_URL,
         session=session,
-        desc="UMM Pass 1/2 (L3T_JET)",
+        desc="CMR CSV (L3T_JET)",
         verbose=verbose,
     )
     if jet_df.empty:
         return pd.DataFrame()
 
-    # Prune tiles below min_granules_floor before querying L2T_LSTE
     jet_counts = jet_df.groupby("tile").size()
     eligible_tiles = set(jet_counts[jet_counts >= max(1, min_granules_floor)].index.tolist())
     if not eligible_tiles:
         return pd.DataFrame()
-    jet_df = jet_df[jet_df["tile"].isin(eligible_tiles)].copy()
 
-    if verbose:
-        logger.info(
-            f"UMM-JSON Pass 2/2 [L2T_LSTE]: indexing clear-sky LSTE granules "
-            f"(max_cloud_cover={max_cloud_cover}) across {len(eligible_tiles):,} eligible tiles..."
-        )
-    lste_df = search_granule_catalog_umm(
-        concept_ID=CONCEPT_IDS["L2T_LSTE"],
-        start_date=start_date,
-        end_date=end_date,
-        max_cloud_cover=max_cloud_cover,
-        allowed_tiles=eligible_tiles,
-        chunk_days=31,
-        max_workers=cmr_workers,
-        CMR_search_URL=CMR_search_URL,
-        session=session,
-        desc="UMM Pass 2/2 (L2T_LSTE)",
-        verbose=verbose,
-    )
-    if lste_df.empty:
-        return pd.DataFrame()
-
-    lste_keys = lste_df[["orbit", "scene", "tile", "timestamp", "cloud_cover"]].drop_duplicates(
-        subset=["orbit", "scene", "tile", "timestamp"]
-    )
-    joined = jet_df.drop(columns=["cloud_cover"]).merge(
-        lste_keys,
-        on=["orbit", "scene", "tile", "timestamp"],
-        how="inner",
-    )
-    if joined.empty:
-        return pd.DataFrame()
-
-    post_counts = joined.groupby("tile").size()
-    final_tiles = set(post_counts[post_counts >= max(1, min_granules_floor)].index.tolist())
-    if not final_tiles:
-        return pd.DataFrame()
-
-    joined = joined[joined["tile"].isin(final_tiles)].copy()
-    joined["quarter"] = joined["date_str"].str[4:6].astype(int).sub(1).floordiv(3).add(1)
-    joined = joined.sort_values(["tile", "timestamp"], kind="mergesort").reset_index(drop=True)
+    catalog = jet_df[jet_df["tile"].isin(eligible_tiles)].copy()
+    catalog["quarter"] = catalog["date_str"].str[4:6].astype(int).sub(1).floordiv(3).add(1)
+    catalog = catalog.sort_values(["tile", "timestamp"], kind="mergesort").reset_index(drop=True)
 
     if not resolve_urls:
-        return joined
+        return catalog
 
     return resolve_granule_asset_urls(
-        granules_df=joined,
+        granules_df=catalog,
         extra_products=extra_products,
         max_cloud_cover=max_cloud_cover,
         CMR_search_URL=CMR_search_URL,

@@ -83,63 +83,44 @@ def test_sample_granule_coordinates_dispersion_and_cropland_balance():
     assert crop_count == 10
 
 
-def test_find_clear_sky_et_granules_uses_umm_join_and_lazy_pattern_resolution(monkeypatch):
+def test_find_clear_sky_et_granules_uses_csv_catalog_and_sidecar_cloud_filter(monkeypatch):
     strat_mod = importlib.import_module("ECOv003_CMR.stratified_sampling")
-    umm_calls = []
+    csv_calls = []
     pattern_calls = []
 
-    def mock_umm(**kwargs):
-        umm_calls.append(kwargs)
-        cid = kwargs["concept_ID"]
-        if cid == "C4057232489-LPCLOUD":  # L3T_JET
-            assert kwargs["max_cloud_cover"] is None
-            return pd.DataFrame(
-                [
-                    {
-                        "granule": "ECOv003_L3T_JET_44814_001_11SLT_20260601T000306_01",
-                        "product": "L3T_JET",
-                        "orbit": 44814,
-                        "scene": 1,
-                        "tile": "11SLT",
-                        "timestamp": "20260601T000306",
-                        "date_str": "20260601",
-                        "time_start": "2026-06-01T00:03:06Z",
-                        "cloud_cover": None,
-                    },
-                    {
-                        "granule": "ECOv003_L3T_JET_44900_002_52NHN_20260605T120000_01",
-                        "product": "L3T_JET",
-                        "orbit": 44900,
-                        "scene": 2,
-                        "tile": "52NHN",
-                        "timestamp": "20260605T120000",
-                        "date_str": "20260605",
-                        "time_start": "2026-06-05T12:00:00Z",
-                        "cloud_cover": None,
-                    },
-                ]
-            )
-        if cid == "C3998139651-LPCLOUD":  # L2T_LSTE (only 11SLT passes cloud_cover <= 20)
-            assert kwargs["max_cloud_cover"] == 20.0
-            return pd.DataFrame(
-                [
-                    {
-                        "granule": "ECOv003_L2T_LSTE_44814_001_11SLT_20260601T000306_02",
-                        "product": "L2T_LSTE",
-                        "orbit": 44814,
-                        "scene": 1,
-                        "tile": "11SLT",
-                        "timestamp": "20260601T000306",
-                        "date_str": "20260601",
-                        "time_start": "2026-06-01T00:03:06Z",
-                        "cloud_cover": 7.5,
-                    }
-                ]
-            )
-        return pd.DataFrame()
+    def mock_csv(**kwargs):
+        csv_calls.append(kwargs)
+        assert kwargs["concept_ID"] == "C4057232489-LPCLOUD"
+        return pd.DataFrame(
+            [
+                {
+                    "granule": "ECOv003_L3T_JET_44814_001_11SLT_20260601T000306_01",
+                    "product": "L3T_JET",
+                    "orbit": 44814,
+                    "scene": 1,
+                    "tile": "11SLT",
+                    "timestamp": "20260601T000306",
+                    "date_str": "20260601",
+                    "time_start": "2026-06-01T00:03:06Z",
+                    "cloud_cover": None,
+                },
+                {
+                    "granule": "ECOv003_L3T_JET_44900_002_52NHN_20260605T120000_01",
+                    "product": "L3T_JET",
+                    "orbit": 44900,
+                    "scene": 2,
+                    "tile": "52NHN",
+                    "timestamp": "20260605T120000",
+                    "date_str": "20260605",
+                    "time_start": "2026-06-05T12:00:00Z",
+                    "cloud_cover": None,
+                },
+            ]
+        )
 
     def mock_patterns(**kwargs):
         pattern_calls.append(kwargs)
+        assert kwargs["max_cloud_cover"] is None
         cid = kwargs["concept_ID"]
         prod_map = {
             "C4057232489-LPCLOUD": ("L3T_JET", "PTJPLSMinst"),
@@ -148,17 +129,30 @@ def test_find_clear_sky_et_granules_uses_umm_join_and_lazy_pattern_resolution(mo
             "C3998139658-LPCLOUD": ("L2T_STARS", "NDVI"),
         }
         prod, var = prod_map[cid]
+        entries = []
         if prod == "L2T_STARS":
-            gid = "ECOv003_L2T_STARS_11SLT_20260601_01"
+            entries.append({"URL": "https://example.test/ECOv003_L2T_STARS_11SLT_20260601_01_NDVI.tif"})
+            entries.append({"URL": "https://example.test/ECOv003_L2T_STARS_52NHN_20260605_01_NDVI.tif"})
         else:
-            gid = f"ECOv003_{prod}_44814_001_11SLT_20260601T000306_01"
-        return [{"URL": f"https://example.test/{gid}_{var}.tif", "cloud_cover": 7.5}]
+            for orb, sc, tl, ts in [
+                (44814, 1, "11SLT", "20260601T000306"),
+                (44900, 2, "52NHN", "20260605T120000"),
+            ]:
+                gid = f"ECOv003_{prod}_{orb:05d}_{sc:03d}_{tl}_{ts}_01"
+                entries.append({"URL": f"https://example.test/{gid}_{var}.tif"})
+                if prod == "L2T_LSTE":
+                    entries.append({"URL": f"https://example.test/{gid}.json"})
+        return entries
 
-    monkeypatch.setattr(strat_mod, "search_granule_catalog_umm", mock_umm)
+    def mock_fetch_meta(url, session=None, timeout=30):
+        # 11SLT is clear (7.5%), 52NHN is cloudy (65.0%)
+        return {"cloud_cover": 7.5 if "11SLT" in url else 65.0}
+
+    monkeypatch.setattr(strat_mod, "search_granule_catalog_csv", mock_csv)
     monkeypatch.setattr(strat_mod, "search_granules_by_name_patterns", mock_patterns)
+    monkeypatch.setattr(strat_mod, "fetch_granule_metadata", mock_fetch_meta)
 
     tiles = ["11SLT", "11SPS", "52NHN"]
-    # When resolve_urls=False, returns lightweight joined catalog with 0 pattern calls
     catalog_only = find_clear_sky_et_granules(
         tiles=tiles,
         start_date="2026-06-01",
@@ -168,13 +162,10 @@ def test_find_clear_sky_et_granules_uses_umm_join_and_lazy_pattern_resolution(mo
         regional_batch_threshold=2,
         verbose=False,
     )
-    assert len(umm_calls) == 2
+    assert len(csv_calls) == 1
     assert len(pattern_calls) == 0
-    assert len(catalog_only) == 1
-    assert catalog_only.iloc[0]["tile"] == "11SLT"
-    assert catalog_only.iloc[0]["cloud_cover"] == 7.5
+    assert len(catalog_only) == 2
 
-    # When resolve_urls=True, resolves all 4 products via pattern batches
     full_df = find_clear_sky_et_granules(
         tiles=tiles,
         start_date="2026-06-01",
@@ -186,6 +177,8 @@ def test_find_clear_sky_et_granules_uses_umm_join_and_lazy_pattern_resolution(mo
     )
     assert len(pattern_calls) == 4
     assert len(full_df) == 1
+    assert full_df.iloc[0]["tile"] == "11SLT"
+    assert full_df.iloc[0]["cloud_cover"] == 7.5
     assert set(full_df.iloc[0]["variable_urls"].keys()) == {"PTJPLSMinst", "LST", "Ta", "NDVI"}
 
 

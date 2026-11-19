@@ -6,6 +6,7 @@ DOWNLOAD_DIRECTORY = join("~", "data", "ECOSTRESS_v003")
 # Base URL for NASA Earthdata Common Metadata Repository (CMR) API
 CMR_SEARCH_URL = "https://cmr.earthdata.nasa.gov/search/"
 CMR_UMM_SEARCH_URL = f"{CMR_SEARCH_URL}granules.umm_json"
+CMR_CSV_SEARCH_URL = f"{CMR_SEARCH_URL}granules.csv"
 
 # --- Level 1 Products ---
 L1CT_RAD_DOI = "10.5067/ECOSTRESS/ECO_L1CT_RAD.003"

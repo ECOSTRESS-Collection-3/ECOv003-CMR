@@ -1,6 +1,8 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
+import io
 import logging
+import random
 import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
@@ -39,29 +41,33 @@ def _request_with_backoff(
     session: Optional[requests.Session] = None,
     max_retries: int = 5,
     backoff_base: float = 1.5,
-    timeout: Tuple[float, float] = (15.0, 60.0),
+    timeout: Tuple[float, float] = (15.0, 90.0),
+    method: str = "GET",
 ) -> requests.Response:
     """
     Execute a CMR GET request with explicit (connect, read) socket timeouts and
-    retry backoff on transient HTTP errors, timeouts, and dropped connections so
-    worker threads never hang indefinitely on stalled sockets.
+    jittered exponential retry backoff on transient HTTP errors, timeouts, and
+    dropped connections so worker threads never hang indefinitely on stalled sockets.
     """
     use_plain_get = (
-        session is None
+        method == "GET"
+        and session is None
         and getattr(requests.get, "__module__", "") != "requests.api"
     )
-    requester = requests.get if use_plain_get else _get_cmr_session(session).get
+    sess = _get_cmr_session(session)
 
     for attempt in range(max_retries):
         try:
             if use_plain_get:
-                response = requester(url, params=params, headers=headers)
+                response = requests.get(url, params=params, headers=headers)
+            elif method == "POST":
+                response = sess.post(url, data=params, headers=headers, timeout=timeout)
             else:
-                response = requester(url, params=params, headers=headers, timeout=timeout)
+                response = sess.get(url, params=params, headers=headers, timeout=timeout)
             status = getattr(response, "status_code", 200)
             if status in _TRANSIENT_CMR_STATUS and attempt < max_retries - 1:
                 retry_after = response.headers.get("Retry-After") if hasattr(response, "headers") else None
-                delay = float(retry_after) if retry_after else backoff_base ** (attempt + 1)
+                delay = float(retry_after) if retry_after else (backoff_base ** (attempt + 1) + random.uniform(0, 0.5))
                 logger.warning(
                     f"CMR transient HTTP {status} (attempt {attempt + 1}/{max_retries}); retrying in {delay:.1f}s"
                 )
@@ -72,7 +78,7 @@ def _request_with_backoff(
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
             if attempt >= max_retries - 1:
                 raise
-            delay = backoff_base ** (attempt + 1)
+            delay = backoff_base ** (attempt + 1) + random.uniform(0, 0.5)
             logger.warning(
                 f"CMR request timeout/connection reset ({exc}); retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})"
             )
@@ -96,23 +102,67 @@ def _split_date_chunks(
     return chunks
 
 
-def search_granule_catalog_umm(
+def _parse_granule_ur_row(
+    granule_ur: str,
+    time_start: Optional[str] = None,
+    cloud_cover: Optional[float] = None,
+    target_tiles: Optional[Set[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    if not granule_ur:
+        return None
+    parts = granule_ur.split("_")
+    product = "_".join(parts[1:3]) if len(parts) > 2 else None
+    if product == "L2T_STARS":
+        if len(parts) <= 4:
+            return None
+        orbit = None
+        scene = None
+        tile = parts[3]
+        ts = parts[4]
+    else:
+        if len(parts) <= 6:
+            return None
+        orbit = int(parts[3]) if parts[3].isdigit() else None
+        scene = int(parts[4]) if parts[4].isdigit() else None
+        tile = parts[5]
+        ts = parts[6]
+
+    if target_tiles is not None and tile not in target_tiles:
+        return None
+
+    return {
+        "granule": granule_ur,
+        "product": product,
+        "orbit": orbit,
+        "scene": scene,
+        "tile": tile,
+        "timestamp": ts,
+        "date_str": ts[:8],
+        "time_start": time_start,
+        "cloud_cover": cloud_cover,
+    }
+
+
+def search_granule_catalog_csv(
     concept_ID: str,
     start_date: Union[date, str],
     end_date: Union[date, str],
-    max_cloud_cover: Optional[float] = None,
     allowed_tiles: Optional[Set[str]] = None,
-    chunk_days: Optional[int] = 31,
-    max_workers: int = 8,
+    chunk_days: Optional[int] = 5,
+    max_workers: int = 6,
     CMR_search_URL: str = CMR_SEARCH_URL,
     session: Optional[requests.Session] = None,
     desc: Optional[str] = None,
     verbose: bool = False,
 ) -> pd.DataFrame:
     """
-    Enumerate Collection 3 granule metadata via NASA CMR's lightweight UMM-JSON
-    endpoint (granules.umm_json), omitting verbose asset link arrays (~80% smaller
-    payloads) and avoiding overlapping spatial bounding-box duplicates.
+    Enumerate Collection 3 granule metadata via NASA CMR's flat granules.csv
+    endpoint (~97% smaller payloads than UMM-JSON/JSON, with zero polygons or
+    asset link arrays) across parallel temporal windows.
+
+    Note: NASA CMR leaves Cloud Cover null on all ECOSTRESS Collection 3
+    granules; do not pass cloud_cover filters to CMR. Scene cloud cover is
+    stored in per-granule .json sidecars (ProductMetadata.QAPercentCloudCover).
     """
     if isinstance(start_date, str):
         start_date = parser.parse(start_date).date()
@@ -121,7 +171,7 @@ def search_granule_catalog_umm(
     elif isinstance(end_date, str):
         end_date = parser.parse(end_date).date()
 
-    umm_url = f"{CMR_search_URL}granules.umm_json"
+    csv_url = f"{CMR_search_URL}granules.csv"
     chunks = _split_date_chunks(start_date, end_date, chunk_days)
     target_tiles = set(allowed_tiles) if allowed_tiles is not None else None
 
@@ -132,8 +182,6 @@ def search_granule_catalog_umm(
             "temporal": f"{w_start}T00:00:00Z,{w_end}T23:59:59Z",
             "page_size": 2000,
         }
-        if max_cloud_cover is not None:
-            params["cloud_cover"] = f"0,{max_cloud_cover}"
 
         rows: List[Dict[str, Any]] = []
         headers: Dict[str, str] = {}
@@ -141,60 +189,28 @@ def search_granule_catalog_umm(
 
         while True:
             response = _request_with_backoff(
-                umm_url, params=params, headers=headers, session=session
+                csv_url, params=params, headers=headers, session=session
             )
-            items = response.json().get("items", [])
-            if not items:
+            text = (response.text or "").strip()
+            if not text:
+                break
+            df_page = pd.read_csv(io.StringIO(text))
+            if df_page.empty or "Granule UR" not in df_page.columns:
                 break
 
-            for item in items:
-                umm = item.get("umm", {})
-                granule_ur = umm.get("GranuleUR", "")
-                if not granule_ur:
-                    continue
-                parts = granule_ur.split("_")
-                product = "_".join(parts[1:3]) if len(parts) > 2 else None
-                if product == "L2T_STARS":
-                    if len(parts) <= 4:
-                        continue
-                    orbit = None
-                    scene = None
-                    tile = parts[3]
-                    ts = parts[4]
-                else:
-                    if len(parts) <= 6:
-                        continue
-                    orbit = int(parts[3]) if parts[3].isdigit() else None
-                    scene = int(parts[4]) if parts[4].isdigit() else None
-                    tile = parts[5]
-                    ts = parts[6]
+            start_col = df_page["Start Time"] if "Start Time" in df_page.columns else [None] * len(df_page)
+            cc_series = pd.to_numeric(df_page["Cloud Cover"], errors="coerce") if "Cloud Cover" in df_page.columns else [None] * len(df_page)
 
-                if target_tiles is not None and tile not in target_tiles:
-                    continue
-
-                raw_cc = umm.get("CloudExtent", {}).get("CloudCover")
-                cloud_cover = float(raw_cc) if raw_cc is not None else None
-                if (
-                    max_cloud_cover is not None
-                    and cloud_cover is not None
-                    and cloud_cover > max_cloud_cover
-                ):
-                    continue
-
-                range_dt = umm.get("TemporalExtent", {}).get("RangeDateTime", {})
-                rows.append(
-                    {
-                        "granule": granule_ur,
-                        "product": product,
-                        "orbit": orbit,
-                        "scene": scene,
-                        "tile": tile,
-                        "timestamp": ts,
-                        "date_str": ts[:8],
-                        "time_start": range_dt.get("BeginningDateTime"),
-                        "cloud_cover": cloud_cover,
-                    }
+            for granule_ur, t_start, raw_cc in zip(df_page["Granule UR"], start_col, cc_series):
+                cc_val = float(raw_cc) if raw_cc is not None and pd.notna(raw_cc) else None
+                parsed = _parse_granule_ur_row(
+                    str(granule_ur),
+                    time_start=str(t_start) if pd.notna(t_start) else None,
+                    cloud_cover=cc_val,
+                    target_tiles=target_tiles,
                 )
+                if parsed is not None:
+                    rows.append(parsed)
 
             search_after = response.headers.get("CMR-Search-After")
             if not search_after:
@@ -214,8 +230,8 @@ def search_granule_catalog_umm(
             futures = [executor.submit(_fetch_window, w) for w in chunks]
             with tqdm(
                 total=len(chunks),
-                desc=desc or f"CMR UMM ({concept_ID})",
-                unit="chunk",
+                desc=desc or f"CMR CSV ({concept_ID})",
+                unit="win",
                 dynamic_ncols=True,
                 disable=not verbose,
             ) as pbar:
@@ -246,13 +262,43 @@ def search_granule_catalog_umm(
     return df.drop_duplicates(subset=["granule"]).reset_index(drop=True)
 
 
+def search_granule_catalog_umm(
+    concept_ID: str,
+    start_date: Union[date, str],
+    end_date: Union[date, str],
+    max_cloud_cover: Optional[float] = None,
+    allowed_tiles: Optional[Set[str]] = None,
+    chunk_days: Optional[int] = 5,
+    max_workers: int = 6,
+    CMR_search_URL: str = CMR_SEARCH_URL,
+    session: Optional[requests.Session] = None,
+    desc: Optional[str] = None,
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """Backward-compatible wrapper delegating global catalog enumeration to search_granule_catalog_csv()."""
+    return search_granule_catalog_csv(
+        concept_ID=concept_ID,
+        start_date=start_date,
+        end_date=end_date,
+        allowed_tiles=allowed_tiles,
+        chunk_days=chunk_days,
+        max_workers=max_workers,
+        CMR_search_URL=CMR_search_URL,
+        session=session,
+        desc=desc,
+        verbose=verbose,
+    )
+
+
 def _extract_matching_links(
     entries: List[Dict[str, Any]],
     max_cloud_cover: Optional[float] = None,
     target_tiles: Optional[Set[str]] = None,
     tif_only: bool = False,
+    allowed_suffixes: Optional[Tuple[str, ...]] = None,
 ) -> List[Dict[str, Any]]:
-    allowed_suffixes = (".tif",) if tif_only else (".tif", ".json", ".aux.xml", ".jpeg")
+    if allowed_suffixes is None:
+        allowed_suffixes = (".tif",) if tif_only else (".tif", ".json", ".aux.xml", ".jpeg")
     records: List[Dict[str, Any]] = []
     for entry in entries:
         raw_cc = entry.get("cloud_cover")
@@ -292,6 +338,7 @@ def search_granules_by_name_patterns(
     granule_patterns: Sequence[str],
     max_cloud_cover: Optional[float] = None,
     tif_only: bool = True,
+    allowed_suffixes: Optional[Tuple[str, ...]] = None,
     CMR_search_URL: str = CMR_SEARCH_URL,
     session: Optional[requests.Session] = None,
 ) -> List[Dict[str, Any]]:
@@ -319,7 +366,7 @@ def search_granules_by_name_patterns(
 
     while True:
         response = _request_with_backoff(
-            granule_search_URL, params=params, headers=headers, session=session
+            granule_search_URL, params=params, headers=headers, session=session, method="POST"
         )
         entries = response.json().get("feed", {}).get("entry", [])
         records.extend(
@@ -328,6 +375,7 @@ def search_granules_by_name_patterns(
                 max_cloud_cover=max_cloud_cover,
                 target_tiles=None,
                 tif_only=tif_only,
+                allowed_suffixes=allowed_suffixes,
             )
         )
         search_after = response.headers.get("CMR-Search-After")

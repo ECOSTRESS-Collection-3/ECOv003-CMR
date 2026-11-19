@@ -48,7 +48,11 @@ def setup_earthdata_session(
             except Exception as e:
                 logger.warning(f"Failed to read .netrc: {e}")
 
+    from requests.adapters import HTTPAdapter
     session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=64, pool_maxsize=64)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
 
     if username and password:
         session.auth = (username, password)

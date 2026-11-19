@@ -4,6 +4,7 @@ import pytest
 
 from ECOv003_CMR.ECOSTRESS_CMR_search_links import (
     ECOSTRESS_CMR_search_links,
+    search_granule_catalog_csv,
     search_granule_catalog_umm,
 )
 from ECOv003_CMR.granule_ID_from_filename import granule_ID_from_filename
@@ -13,11 +14,9 @@ from ECOv003_CMR.variable_from_filename import variable_from_filename
 
 
 class MockCMRResponse:
-    def __init__(self, entries=None, headers=None, items=None):
-        if items is not None:
-            self.payload = {"items": items}
-        else:
-            self.payload = {"feed": {"entry": entries or []}}
+    def __init__(self, entries=None, headers=None, text=None):
+        self.payload = {"feed": {"entry": entries or []}}
+        self.text = text or ""
         self.headers = headers or {}
 
     def raise_for_status(self):
@@ -27,39 +26,20 @@ class MockCMRResponse:
         return self.payload
 
 
-def test_search_granule_catalog_umm_paginates_and_filters_tiles(monkeypatch):
+def test_search_granule_catalog_csv_paginates_and_filters_tiles(monkeypatch):
     search_after = '["provider", 999]'
+    csv_page_1 = (
+        "Granule UR,Start Time,Cloud Cover\n"
+        "ECOv003_L3T_JET_44814_001_11SLT_20260601T000306_01,2026-06-01T00:03:06Z,\n"
+        "ECOv003_L3T_JET_44814_001_52NHN_20260601T000306_01,2026-06-01T00:03:06Z,\n"
+    )
+    csv_page_2 = (
+        "Granule UR,Start Time,Cloud Cover\n"
+        "ECOv003_L3T_JET_44860_002_11SLT_20260602T120000_01,2026-06-02T12:00:00Z,\n"
+    )
     responses = [
-        MockCMRResponse(
-            items=[
-                {
-                    "umm": {
-                        "GranuleUR": "ECOv003_L2T_LSTE_44814_001_11SLT_20260601T000306_02",
-                        "TemporalExtent": {"RangeDateTime": {"BeginningDateTime": "2026-06-01T00:03:06Z"}},
-                        "CloudExtent": {"CloudCover": 12.5},
-                    }
-                },
-                {
-                    "umm": {
-                        "GranuleUR": "ECOv003_L2T_LSTE_44814_001_52NHN_20260601T000306_02",
-                        "TemporalExtent": {"RangeDateTime": {"BeginningDateTime": "2026-06-01T00:03:06Z"}},
-                        "CloudExtent": {"CloudCover": 5.0},
-                    }
-                },
-            ],
-            headers={"CMR-Search-After": search_after},
-        ),
-        MockCMRResponse(
-            items=[
-                {
-                    "umm": {
-                        "GranuleUR": "ECOv003_L2T_LSTE_44860_002_11SLT_20260602T120000_02",
-                        "TemporalExtent": {"RangeDateTime": {"BeginningDateTime": "2026-06-02T12:00:00Z"}},
-                        "CloudExtent": {"CloudCover": 8.0},
-                    }
-                }
-            ]
-        ),
+        MockCMRResponse(text=csv_page_1, headers={"CMR-Search-After": search_after}),
+        MockCMRResponse(text=csv_page_2),
     ]
     calls = []
 
@@ -70,20 +50,29 @@ def test_search_granule_catalog_umm_paginates_and_filters_tiles(monkeypatch):
     mod = importlib.import_module("ECOv003_CMR.ECOSTRESS_CMR_search_links")
     monkeypatch.setattr(mod.requests, "get", mock_get)
 
-    df = search_granule_catalog_umm(
-        concept_ID="C3998139651-LPCLOUD",
+    df = search_granule_catalog_csv(
+        concept_ID="C4057232489-LPCLOUD",
         start_date="2026-06-01",
         end_date="2026-06-02",
-        max_cloud_cover=20.0,
         allowed_tiles={"11SLT"},
         chunk_days=None,
     )
 
     assert len(df) == 2
     assert set(df["tile"]) == {"11SLT"}
-    assert df["cloud_cover"].tolist() == [12.5, 8.0]
-    assert calls[0]["url"].endswith("granules.umm_json")
-    assert calls[0]["params"]["cloud_cover"] == "0,20.0"
+    assert calls[0]["url"].endswith("granules.csv")
+    assert "cloud_cover" not in calls[0]["params"]
+
+    # Wrapper alias remains compatible
+    responses.extend([MockCMRResponse(text=csv_page_2)])
+    df2 = search_granule_catalog_umm(
+        concept_ID="C4057232489-LPCLOUD",
+        start_date="2026-06-02",
+        end_date="2026-06-02",
+        allowed_tiles={"11SLT"},
+        chunk_days=None,
+    )
+    assert len(df2) == 1
 
 
 def test_search_links_follows_search_after_pages(monkeypatch):
