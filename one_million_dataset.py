@@ -1,27 +1,17 @@
 #!/usr/bin/env python3
 """
-First-pass global 1,000,000-observation stratified ECOSTRESS Collection 3 dataset
-generator.
+Global 1,000,000-observation stratified ECOSTRESS Collection 3 dataset generator.
 
 Usage:
-    # Full global 1M-sample run across a multi-month window (resumable via checkpoint manifest)
-    python one_million_dataset.py \
-        --start-date 2026-06-01 \
-        --end-date 2026-09-30 \
-        --output-dir ./uq_dataset_1m
+    # Step 1: Pre-flight dry run (~2m) to cache candidate_granules.parquet and inspect capacity plan
+    python one_million_dataset.py --dry-run
 
-    # Fast pilot run on a subset of tiles before launching the global pass
-    python one_million_dataset.py \
-        --start-date 2026-06-01 \
-        --end-date 2026-06-30 \
-        --tiles 11SLT 11SPS 52NHN 53NMH \
-        --target-samples 10000 \
-        --min-granules-floor 2 \
-        --output-dir ./uq_dataset_pilot
+    # Step 2: Execute global 1M-sample extraction (resumable via checkpoint manifest)
+    python one_million_dataset.py
 """
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import logging
 from pathlib import Path
@@ -64,14 +54,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./uq_dataset_1m",
-        help="Directory for partitioned Parquet outputs, checkpoint manifest, and catalog cache (default: ./uq_dataset_1m).",
+        default="./experimental_data/one_million_dataset",
+        help="Directory for partitioned Parquet outputs, checkpoint manifest, and catalog cache.",
     )
     parser.add_argument(
         "--start-date",
         type=str,
-        default="2026-06-01",
-        help="Acquisition window start date in YYYY-MM-DD format (default: 2026-06-01).",
+        default="2025-10-31",
+        help="Acquisition window start date in YYYY-MM-DD format (default: 2025-10-31).",
     )
     parser.add_argument(
         "--end-date",
@@ -102,7 +92,7 @@ def parse_args() -> argparse.Namespace:
         "--max-cloud-cover",
         type=float,
         default=20.0,
-        help="Maximum CMR granule cloud cover percentage (default: 20.0).",
+        help="Maximum sidecar QAPercentCloudCover percentage (default: 20.0).",
     )
     parser.add_argument(
         "--dispersion-strategy",
@@ -120,8 +110,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=8,
-        help="Concurrent granule workers (default: 8).",
+        default=12,
+        help="Concurrent granule workers (default: 12).",
     )
     parser.add_argument(
         "--layer-workers",
@@ -132,8 +122,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-concurrent-streams",
         type=int,
-        default=32,
-        help="Process-wide semaphore cap on simultaneous /vsicurl/ HTTP streams (default: 32).",
+        default=48,
+        help="Process-wide semaphore cap on simultaneous /vsicurl/ HTTP streams (default: 48).",
     )
     parser.add_argument(
         "--batch-size",
@@ -150,6 +140,11 @@ def parse_args() -> argparse.Namespace:
         "--export-csv",
         action="store_true",
         help="Also write CSV alongside each partitioned Parquet file.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run global discovery and stratification capacity planning only without reading COGs.",
     )
     parser.add_argument(
         "--seed",
@@ -180,7 +175,8 @@ def main() -> None:
     logger.info(
         f"Configuration: window={args.start_date}..{args.end_date}, "
         f"target_samples={args.target_samples:,}, min_granules_floor={args.min_granules_floor}, "
-        f"max_cloud_cover={args.max_cloud_cover}%, workers={args.max_workers}x{args.layer_workers} "
+        f"max_cloud_cover={args.max_cloud_cover}%, dry_run={args.dry_run}, "
+        f"workers={args.max_workers}x{args.layer_workers} "
         f"(streams={args.max_concurrent_streams}, batch_size={args.batch_size})"
     )
 
@@ -203,6 +199,7 @@ def main() -> None:
         batch_size=args.batch_size,
         refresh_catalog=args.refresh_catalog,
         export_csv=args.export_csv,
+        dry_run=args.dry_run,
         random_state=args.seed,
         session=session,
         verbose=True,
@@ -212,7 +209,7 @@ def main() -> None:
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(
             {
-                "generated_at_utc": datetime.utcnow().isoformat() + "Z",
+                "generated_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "config": vars(args),
                 "summary": _serialize_summary(summary),
             },
@@ -222,12 +219,18 @@ def main() -> None:
 
     print("\n=== UQ Dataset Generation Summary ===")
     print(f"Output directory  : {output_dir.resolve()}")
+    print(f"Dry run           : {summary.get('dry_run', False)}")
     print(f"Collected samples : {summary.get('total_samples', 0):,}")
     print(f"Selected granules : {summary.get('selected_granules', 0):,} (N_cap={summary.get('n_cap', 0)}, K={summary.get('quota_k', 0)})")
 
+    plan = summary.get("stratification_plan")
+    if plan is not None and not plan.empty:
+        print("\nPre-Flight Stratification Plan:")
+        print(plan.to_string(index=False))
+
     perf = summary.get("performance", {})
-    if perf:
-        print(f"Total wall time   : {perf.get('timings_s', {}).get('total_s', 0):.2f}s")
+    if perf and not args.dry_run:
+        print(f"\nTotal wall time   : {perf.get('timings_s', {}).get('total_s', 0):.2f}s")
         print(f"Mean per-granule  : {perf.get('mean_granule_latency_s', 0):.2f}s")
         print(f"Throughput        : {perf.get('samples_per_second', 0):.2f} samples/s")
 

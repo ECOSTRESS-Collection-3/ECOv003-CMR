@@ -16,6 +16,7 @@ from ECOv003_CMR.point_sampling import (
 from ECOv003_CMR.stratified_sampling import (
     compute_per_granule_quota,
     find_clear_sky_et_granules,
+    plan_stratified_sampling,
     sample_granule_coordinates,
     select_stratified_granules,
 )
@@ -31,6 +32,37 @@ def test_expanded_layer_mapping_includes_jet_and_uq_layers():
     assert LAYER_MAPPING["view_zenith"] == ("L2T_LSTE", "view_zenith")
     assert LAYER_MAPPING["ESI"] == ("L4T_ESI", "ESI")
     assert LAYER_MAPPING["WUE"] == ("L4T_WUE", "WUE")
+
+
+def test_plan_stratified_sampling_forecasts_capacity_and_biomes():
+    rows = []
+    # Temperate tile with 10 scenes, tropical tile with 8 scenes, boreal tile with 3 scenes
+    for i in range(10):
+        rows.append({"granule": f"G_TEMP_{i}", "tile": "11SLT", "date_str": "20260601"})
+    for i in range(8):
+        rows.append({"granule": f"G_TROP_{i}", "tile": "20LLQ", "date_str": "20260601"})
+    for i in range(3):
+        rows.append({"granule": f"G_BOR_{i}", "tile": "56VPH", "date_str": "20260601"})
+
+    plan = plan_stratified_sampling(
+        catalog_df=pd.DataFrame(rows),
+        target_total_samples=100_000,
+        candidate_floors=(2, 4, 6),
+        expected_cloud_pass_rate=0.5,
+        max_workers=10,
+    ).set_index("min_granules_floor")
+
+    # At floor=2: expected clear counts are 5.0, 4.0, 1.5 -> 2 tiles survive (11SLT, 20LLQ), n_cap=4
+    assert plan.loc[2, "eligible_tiles"] == 2
+    assert plan.loc[2, "temperate_tiles"] == 1
+    assert plan.loc[2, "tropical_tiles"] == 1
+    assert plan.loc[2, "n_cap"] == 4
+    assert plan.loc[2, "selected_granules"] == 8
+    assert plan.loc[2, "quota_k"] == 12_500
+
+    # At floor=6: 0 tiles survive
+    assert plan.loc[6, "eligible_tiles"] == 0
+    assert plan.loc[6, "selected_granules"] == 0
 
 
 def test_select_stratified_granules_caps_and_balances_seasons():
@@ -83,12 +115,44 @@ def test_sample_granule_coordinates_dispersion_and_cropland_balance():
     assert crop_count == 10
 
 
-def test_find_clear_sky_et_granules_uses_regional_boxes_for_large_tile_lists(monkeypatch):
+def test_find_clear_sky_et_granules_uses_csv_catalog_and_sidecar_cloud_filter(monkeypatch):
     strat_mod = importlib.import_module("ECOv003_CMR.stratified_sampling")
-    regional_calls = []
+    csv_calls = []
+    pattern_calls = []
 
-    def mock_entries(**kwargs):
-        regional_calls.append(kwargs)
+    def mock_csv(**kwargs):
+        csv_calls.append(kwargs)
+        assert kwargs["concept_ID"] == "C4057232489-LPCLOUD"
+        return pd.DataFrame(
+            [
+                {
+                    "granule": "ECOv003_L3T_JET_44814_001_11SLT_20260601T000306_01",
+                    "product": "L3T_JET",
+                    "orbit": 44814,
+                    "scene": 1,
+                    "tile": "11SLT",
+                    "timestamp": "20260601T000306",
+                    "date_str": "20260601",
+                    "time_start": "2026-06-01T00:03:06Z",
+                    "cloud_cover": None,
+                },
+                {
+                    "granule": "ECOv003_L3T_JET_44900_002_52NHN_20260605T120000_01",
+                    "product": "L3T_JET",
+                    "orbit": 44900,
+                    "scene": 2,
+                    "tile": "52NHN",
+                    "timestamp": "20260605T120000",
+                    "date_str": "20260605",
+                    "time_start": "2026-06-05T12:00:00Z",
+                    "cloud_cover": None,
+                },
+            ]
+        )
+
+    def mock_patterns(**kwargs):
+        pattern_calls.append(kwargs)
+        assert kwargs["max_cloud_cover"] is None
         cid = kwargs["concept_ID"]
         prod_map = {
             "C4057232489-LPCLOUD": ("L3T_JET", "PTJPLSMinst"),
@@ -97,33 +161,66 @@ def test_find_clear_sky_et_granules_uses_regional_boxes_for_large_tile_lists(mon
             "C3998139658-LPCLOUD": ("L2T_STARS", "NDVI"),
         }
         prod, var = prod_map[cid]
+        entries = []
         if prod == "L2T_STARS":
-            gid = "ECOv003_L2T_STARS_11SLT_20260601_01"
+            entries.append({"URL": "https://example.test/ECOv003_L2T_STARS_11SLT_20260601_01_NDVI.tif"})
+            entries.append({"URL": "https://example.test/ECOv003_L2T_STARS_52NHN_20260605_01_NDVI.tif"})
         else:
-            gid = f"ECOv003_{prod}_44814_001_11SLT_20260601T000306_01"
-        return [{"URL": f"https://example.test/{gid}_{var}.tif", "cloud_cover": 5.0}]
+            for orb, sc, tl, ts in [
+                (44814, 1, "11SLT", "20260601T000306"),
+                (44900, 2, "52NHN", "20260605T120000"),
+            ]:
+                gid = f"ECOv003_{prod}_{orb:05d}_{sc:03d}_{tl}_{ts}_01"
+                entries.append({"URL": f"https://example.test/{gid}_{var}.tif"})
+                if prod == "L2T_LSTE":
+                    entries.append({"URL": f"https://example.test/{gid}.json"})
+        return entries
 
-    monkeypatch.setattr(strat_mod, "ECOSTRESS_CMR_search_entries", mock_entries)
+    def mock_fetch_meta(url, session=None, timeout=30):
+        # 11SLT is clear (7.5%), 52NHN is cloudy (65.0%)
+        return {"cloud_cover": 7.5 if "11SLT" in url else 65.0}
+
+    monkeypatch.setattr(strat_mod, "search_granule_catalog_csv", mock_csv)
+    monkeypatch.setattr(strat_mod, "search_granules_by_name_patterns", mock_patterns)
+    monkeypatch.setattr(strat_mod, "fetch_granule_metadata", mock_fetch_meta)
+
     tiles = ["11SLT", "11SPS", "52NHN"]
-    df = find_clear_sky_et_granules(
+    catalog_only = find_clear_sky_et_granules(
         tiles=tiles,
         start_date="2026-06-01",
-        end_date="2026-06-02",
+        end_date="2026-06-06",
+        max_cloud_cover=20.0,
+        resolve_urls=False,
         regional_batch_threshold=2,
+        verbose=False,
     )
-    assert len(regional_calls) > 0
-    assert len(df) == 1
-    assert df.iloc[0]["tile"] == "11SLT"
+    assert len(csv_calls) == 1
+    assert len(pattern_calls) == 0
+    assert len(catalog_only) == 2
+
+    full_df = find_clear_sky_et_granules(
+        tiles=tiles,
+        start_date="2026-06-01",
+        end_date="2026-06-06",
+        max_cloud_cover=20.0,
+        resolve_urls=True,
+        regional_batch_threshold=2,
+        verbose=False,
+    )
+    assert len(pattern_calls) == 4
+    assert len(full_df) == 1
+    assert full_df.iloc[0]["tile"] == "11SLT"
+    assert full_df.iloc[0]["cloud_cover"] == 7.5
+    assert set(full_df.iloc[0]["variable_urls"].keys()) == {"PTJPLSMinst", "LST", "Ta", "NDVI"}
 
 
-def test_build_stratified_dataset_catalog_cache_and_quota_refill(monkeypatch, tmp_path):
+def test_build_stratified_dataset_dry_run_and_catalog_cache(monkeypatch, tmp_path):
     builder_mod = importlib.import_module("ECOv003_CMR.stratified_dataset_builder")
 
     et_path = tmp_path / "et.tif"
     lst_path = tmp_path / "lst.tif"
     affine = from_origin(-120.0, 40.0, 0.01, 0.01)
 
-    # Create a 20x20 grid where PTJPLSMinst is valid everywhere, but LST has NaNs in top half
     et_arr = np.full((20, 20), 350.0, dtype="float32")
     lst_arr = np.full((20, 20), 300.15, dtype="float32")
     lst_arr[:12, :] = np.nan
@@ -165,10 +262,30 @@ def test_build_stratified_dataset_catalog_cache_and_quota_refill(monkeypatch, tm
 
     monkeypatch.setattr(builder_mod, "find_clear_sky_et_granules", mock_find_granules)
 
-    out1 = tmp_path / "run1"
     shared_catalog = str(tmp_path / "shared_catalog.parquet")
+
+    # Dry run caches catalog and returns stratification_plan without extracting samples
+    dry_summary = builder_mod.build_stratified_dataset(
+        output_dir=str(tmp_path / "dry"),
+        start_date="2026-06-01",
+        end_date="2026-06-07",
+        tiles=["11SLT"],
+        target_total_samples=20,
+        min_granules_floor=1,
+        layers=["PTJPLSMinst", "ST_C"],
+        catalog_path=shared_catalog,
+        dry_run=True,
+        session=Mock(),
+        verbose=False,
+    )
+    assert len(search_calls) == 1
+    assert dry_summary["dry_run"] is True
+    assert dry_summary["total_samples"] == 0
+    assert not dry_summary["stratification_plan"].empty
+
+    # Live run with refresh_catalog=False reuses cached catalog (0 CMR searches)
     summary1 = builder_mod.build_stratified_dataset(
-        output_dir=str(out1),
+        output_dir=str(tmp_path / "run1"),
         start_date="2026-06-01",
         end_date="2026-06-07",
         tiles=["11SLT"],
@@ -183,24 +300,6 @@ def test_build_stratified_dataset_catalog_cache_and_quota_refill(monkeypatch, tm
     )
     assert len(search_calls) == 1
     assert summary1["total_samples"] == 20
-
-    # Second run with refresh_catalog=False should hit cached catalog with 0 CMR searches
-    out2 = tmp_path / "run2"
-    summary2 = builder_mod.build_stratified_dataset(
-        output_dir=str(out2),
-        start_date="2026-06-01",
-        end_date="2026-06-07",
-        tiles=["11SLT"],
-        target_total_samples=15,
-        min_granules_floor=1,
-        layers=["PTJPLSMinst", "ST_C"],
-        catalog_path=shared_catalog,
-        refresh_catalog=False,
-        session=Mock(),
-        verbose=False,
-    )
-    assert len(search_calls) == 1
-    assert summary2["total_samples"] == 15
 
 
 def test_sample_points_from_granule_vectorized_and_summary(tmp_path):
