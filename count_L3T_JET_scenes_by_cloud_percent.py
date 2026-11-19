@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Fast global L3T_JET scene counts by cloud cover threshold using NASA CMR's
-lightweight granules.csv endpoint (no spatial polygons or asset URL arrays)
-and 5-day parallel temporal windows.
+lightweight granules.csv endpoint with retry backoff and 5-day temporal windows.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 import io
+import random
+import threading
 import time
 from typing import List, Optional, Tuple
 
@@ -18,6 +19,41 @@ from tqdm.auto import tqdm
 CMR_CSV_URL = "https://cmr.earthdata.nasa.gov/search/granules.csv"
 L3T_JET_CONCEPT_ID = "C4057232489-LPCLOUD"
 L2T_LSTE_CONCEPT_ID = "C3998139651-LPCLOUD"
+TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+_THREAD_LOCAL = threading.local()
+
+
+def _get_session() -> requests.Session:
+    sess = getattr(_THREAD_LOCAL, "sess", None)
+    if sess is None:
+        sess = requests.Session()
+        _THREAD_LOCAL.sess = sess
+    return sess
+
+
+def _get_with_retry(
+    url: str,
+    params: dict,
+    headers: dict,
+    max_retries: int = 5,
+    timeout: Tuple[float, float] = (15.0, 90.0),
+) -> requests.Response:
+    sess = _get_session()
+    for attempt in range(max_retries):
+        try:
+            resp = sess.get(url, params=params, headers=headers, timeout=timeout)
+            if resp.status_code in TRANSIENT_STATUS and attempt < max_retries - 1:
+                retry_after = resp.headers.get("Retry-After")
+                delay = float(retry_after) if retry_after else (1.5 ** (attempt + 1) + random.uniform(0, 0.5))
+                time.sleep(delay)
+                continue
+            resp.raise_for_status()
+            return resp
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            if attempt >= max_retries - 1:
+                raise
+            time.sleep(1.5 ** (attempt + 1) + random.uniform(0, 0.5))
+    raise RuntimeError(f"CMR request failed after {max_retries} retries")
 
 
 def _date_windows(start_str: str, end_str: str, chunk_days: int = 5) -> List[Tuple[date, date]]:
@@ -49,11 +85,9 @@ def _fetch_csv_window(
     frames = []
     headers = {}
     prev_token = None
-    sess = requests.Session()
 
     while True:
-        resp = sess.get(CMR_CSV_URL, params=params, headers=headers, timeout=(15, 60))
-        resp.raise_for_status()
+        resp = _get_with_retry(CMR_CSV_URL, params=params, headers=headers)
         text = resp.text.strip()
         if not text:
             break
@@ -77,7 +111,7 @@ def fetch_cmr_csv_catalog(
     end_date: str,
     max_cloud_cover: Optional[float] = None,
     chunk_days: int = 5,
-    max_workers: int = 16,
+    max_workers: int = 6,
     desc: str = "CMR CSV",
 ) -> pd.DataFrame:
     windows = _date_windows(start_date, end_date, chunk_days=chunk_days)
@@ -93,8 +127,6 @@ def fetch_cmr_csv_catalog(
         return pd.DataFrame(columns=["granule", "join_key", "cloud_cover"])
 
     raw = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["Granule UR"])
-    # Strip product prefix ('ECOv003_L3T_JET_' or 'ECOv003_L2T_LSTE_') and build suffix ('_01')
-    # leaving exact '<ORBIT>_<SCENE>_<TILE>_<TIMESTAMP>' join key
     parts = raw["Granule UR"].str.split("_")
     raw["join_key"] = parts.str[3:7].str.join("_")
     raw["cloud_cover"] = pd.to_numeric(raw.get("Cloud Cover"), errors="coerce")
@@ -107,7 +139,6 @@ def main(start_date: str = "2025-10-31", end_date: str = "2026-10-31") -> None:
     jet_df = fetch_cmr_csv_catalog(
         L3T_JET_CONCEPT_ID, start_date, end_date, max_cloud_cover=None, desc="L3T_JET (all)"
     )
-    # Only fetch L2T_LSTE <= 20% cloud cover since 10% and 0% are subsets of 20%
     lste_clear = fetch_cmr_csv_catalog(
         L2T_LSTE_CONCEPT_ID, start_date, end_date, max_cloud_cover=20.0, desc="L2T_LSTE (<=20%)"
     ).drop_duplicates(subset=["join_key"])
