@@ -16,6 +16,9 @@ download_files_module = importlib.import_module(
 download_batch_module = importlib.import_module(
     "ECOv003_CMR.download_ECOSTRESS"
 )
+download_file_module = importlib.import_module(
+    "ECOv003_CMR.download_file"
+)
 
 
 class MisparsedGranule(ECOSTRESSGranule):
@@ -174,6 +177,101 @@ def test_download_granule_files_propagates_session(monkeypatch, tmp_path):
     )
 
     assert seen_sessions == [mock_session]
+
+
+def test_get_granule_from_listing_raises_file_not_found_when_empty():
+    with pytest.raises(FileNotFoundError, match="No matching ECOSTRESS granules"):
+        download_files_module.get_granule_from_listing(pd.DataFrame())
+
+
+def test_get_granule_from_listing_selects_latest_build_and_filters_urls(monkeypatch, tmp_path):
+    stem = "ECOv003_L3T_ETAUX_44841_001_11SPS_20260602T180012"
+    listing = pd.DataFrame([
+        {"granule": f"{stem}_01", "URL": f"https://example.test/{stem}_01_Ta.tif"},
+        {"granule": f"{stem}_03", "URL": f"https://example.test/{stem}_03_Ta.tif"},
+        {"granule": f"{stem}_02", "URL": f"https://example.test/{stem}_02_Ta.tif"},
+    ])
+
+    gid = download_files_module.get_granule_from_listing(listing)
+    assert str(gid) == f"{stem}_03"
+
+    downloaded_urls = []
+
+    def mock_download_file(URL, filename, session=None):
+        downloaded_urls.append(URL)
+        return filename
+
+    monkeypatch.setattr(download_files_module, "download_file", mock_download_file)
+
+    directory = download_files_module.download_ECOSTRESS_granule_files(
+        product="L3T_ETAUX",
+        tile="11SPS",
+        acquisition_date="2026-06-02",
+        parent_directory=str(tmp_path),
+        CMR_file_listing_df=listing,
+        session=Mock(),
+    )
+
+    assert directory.endswith(f"{stem}_03")
+    assert downloaded_urls == [f"https://example.test/{stem}_03_Ta.tif"]
+
+
+def test_get_granule_from_listing_rejects_distinct_granule_stems():
+    listing = pd.DataFrame([
+        {"granule": "ECOv003_L2T_LSTE_44814_001_52NHN_20260601T000306_02"},
+        {"granule": "ECOv003_L2T_LSTE_44860_002_52NHN_20260601T120000_02"},
+    ])
+    with pytest.raises(ValueError, match="distinct granules"):
+        download_files_module.get_granule_from_listing(listing)
+
+
+def test_download_file_retries_on_midstream_timeout_and_cleans_partial(monkeypatch, tmp_path):
+    monkeypatch.setattr(download_file_module.time, "sleep", lambda _: None)
+    target = tmp_path / "ECOv003_L3T_ETAUX_44841_001_11SPS_20260602T180012_02_Rg.tif"
+    partial = tmp_path / f"{target.name}.download"
+
+    class StallThenSucceedSession:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, stream=True, allow_redirects=True, timeout=None):
+            assert timeout == (15.0, 90.0)
+            self.calls += 1
+            attempt = self.calls
+
+            class FakeResponse:
+                status_code = 200
+                headers = {"content-length": "8"}
+
+                def raise_for_status(self):
+                    pass
+
+                def iter_content(self, chunk_size=1024):
+                    yield b"part"
+                    if attempt == 1:
+                        raise TimeoutError(60, "Operation timed out")
+                    yield b"data"
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+            return FakeResponse()
+
+    session = StallThenSucceedSession()
+    result = download_file_module.download_file(
+        "https://example.test/Rg.tif",
+        filename=str(target),
+        session=session,
+        max_retries=3,
+    )
+
+    assert session.calls == 2
+    assert result == str(target)
+    assert target.read_bytes() == b"partdata"
+    assert not partial.exists()
 
 
 def test_download_ecostress_extracts_per_granule_acquisition_date(monkeypatch):

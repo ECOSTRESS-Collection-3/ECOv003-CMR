@@ -1,6 +1,7 @@
 from typing import Optional, Union
 from os.path import join
 from datetime import date
+import logging
 import posixpath
 import warnings
 import pandas as pd
@@ -12,17 +13,33 @@ from .granule_ID import GranuleID
 from .download_file import download_file
 from .ECOSTRESS_CMR_search import ECOSTRESS_CMR_search
 
+logger = logging.getLogger(__name__)
+
 
 def get_granule_from_listing(listing: pd.DataFrame) -> GranuleID:
     """
-    Extracts the granule ID from a listing DataFrame.
+    Extracts the latest-build granule ID from a listing DataFrame.
     """
-    granule_IDs = list(listing.granule.unique())
+    if listing.empty or "granule" not in listing.columns:
+        raise FileNotFoundError("No matching ECOSTRESS granules found in CMR listing")
 
-    if len(granule_IDs) != 1:
-        raise ValueError(f"there are {len(granule_IDs)} found in listing")
+    granule_IDs = sorted(listing.granule.dropna().astype(str).unique())
+    if not granule_IDs:
+        raise FileNotFoundError("No matching ECOSTRESS granules found in CMR listing")
 
-    return GranuleID(granule_IDs[0])
+    stems = {"_".join(gid.split("_")[:-1]) for gid in granule_IDs}
+
+    if len(stems) != 1:
+        raise ValueError(f"there are {len(granule_IDs)} distinct granules found in listing")
+
+    latest_granule_ID = granule_IDs[-1]
+    if len(granule_IDs) > 1:
+        logger.info(
+            f"Multiple builds found in CMR listing ({', '.join(granule_IDs)}); "
+            f"selecting latest build {latest_granule_ID}"
+        )
+
+    return GranuleID(latest_granule_ID)
 
 
 def download_ECOSTRESS_granule_files(
@@ -65,6 +82,7 @@ def download_ECOSTRESS_granule_files(
         )
 
     granule_ID = get_granule_from_listing(CMR_file_listing_df)
+    CMR_file_listing_df = CMR_file_listing_df[CMR_file_listing_df["granule"] == str(granule_ID)]
 
     if orbit is not None and orbit != granule_ID.orbit:
         raise ValueError(f"given orbit {orbit} does not match listed orbit {granule_ID.orbit}")
