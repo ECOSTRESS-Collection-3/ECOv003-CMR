@@ -20,6 +20,8 @@
 10. [Python API: Granule ID, Filename & Tile Utilities](#python-api-granule-id-filename--tile-utilities)
 11. [Examples](#examples)
 12. [Development and Testing](#development-and-testing)
+13. [Version History](#version-history)
+14. [Known Issues](#known-issues)
 
 ---
 
@@ -105,16 +107,32 @@ Installing `ECOv003-CMR` registers two CLI commands: `ECOv003-search` and `ECOv0
 
 ```bash
 # Print matching unique granule IDs to stdout
-ECOv003-search   --product L2T_LSTE L2T_STARS L3T_JET   --tile 52NHN 53NMH   --start-date 2026-06-01   --end-date 2026-06-07
+ECOv003-search \
+  --product L2T_LSTE L2T_STARS L3T_JET \
+  --tile 52NHN 53NMH \
+  --start-date 2026-06-01 \
+  --end-date 2026-06-07
 
 # Filter by orbit/scene/cloud cover and export full file listing to CSV
-ECOv003-search   --product L2T_LSTE   --tile 52NHN   --start-date 2026-06-01   --orbit 44814   --scene 1   --max-cloud-cover 20   --output ecostress-files.csv
+ECOv003-search \
+  --product L2T_LSTE \
+  --tile 52NHN \
+  --start-date 2026-06-01 \
+  --orbit 44814 \
+  --scene 1 \
+  --max-cloud-cover 20 \
+  --output ecostress-files.csv
 ```
 
 ### `ECOv003-download`
 
 ```bash
-ECOv003-download   --product L2T_LSTE L2T_STARS L3T_ETAUX   --tile 11SLT 11SPS   --start-date 2026-06-01   --end-date 2026-06-07   --parent-directory ~/data/ECOSTRESS_v003
+ECOv003-download \
+  --product L2T_LSTE L2T_STARS L3T_ETAUX \
+  --tile 11SLT 11SPS \
+  --start-date 2026-06-01 \
+  --end-date 2026-06-07 \
+  --parent-directory ~/data/ECOSTRESS_v003
 ```
 
 ---
@@ -310,3 +328,35 @@ pytest -m integration -v
 make test-sampler
 make build
 ```
+
+---
+
+## Version History
+
+- **`v1.4.0` (Current Release):**
+  - Hardened `download_file()` with explicit `(connect, read)` socket timeouts (`(15.0, 90.0)`), jittered exponential retry backoff on transient HTTP errors and mid-stream `TimeoutError` / `RequestException` / `OSError` stalls, and unconditional cleanup of partial `.download` files before each retry and on failure.
+  - Updated `get_granule_from_listing()` and `download_ECOSTRESS_granule_files()` to select the latest build revision when CMR returns multiple builds of the same granule stem and raise `FileNotFoundError` when a CMR search returns zero granules.
+  - Added `PackageNotFoundError` fallback version resolution in `ECOv003_CMR/version.py` and expanded live integration tests.
+- **`v1.3.1`:**
+  - Replaced `granules.umm_json` sweeps with NASA CMR's lightweight `granules.csv` endpoint across 5-day parallel temporal windows (~97% smaller payloads), enumerating all 348,477 global `L3T_JET` scenes in ~2 minutes.
+  - Switched wildcard `readable_granule_name[]` resolution to HTTP `POST` requests to eliminate `414 Request-URI Too Large` errors on 150-pattern batches.
+  - Removed null CMR `cloud_cover` query parameters and added concurrent `.json` sidecar `ProductMetadata.QAPercentCloudCover` filtering (`filter_granules_by_sidecar_cloud_cover()`, `estimate_cloud_cover_distribution()`) with empirical rejection-aware tile backfill.
+  - Mounted a 64-socket `HTTPAdapter` connection pool in `setup_earthdata_session()` to eliminate `urllib3` pool exhaustion under high thread concurrency.
+  - Added `plan_stratified_sampling()` and `dry_run=True` mode across `build_stratified_dataset()`, `one_hundred_dataset.py`, and `one_million_dataset.py` to forecast biome coverage, $N_{	ext{cap}}$, quota $K$, and wall time before reading COGs.
+- **`v1.3.0`:**
+  - Vectorized global land MGRS tile discovery via `sentinel_tiles.sentinel_polygons` (14,749 tiles in 0.62s) and updated `find_sentinel2_tile()` to use true polygon intersection with land filtering.
+  - Added SHA-256 validated `candidate_granules.parquet` caching, bounded `/vsicurl/` HTTP stream concurrency (`max_concurrent_streams`), Netscape URS cookie export (`MozillaCookieJar`) with synchronous `batch_size` re-warming, adaptive per-granule quota refills, and $O(1)$-RAM `pyarrow.parquet` diagnostics in `summarize_point_samples()`.
+  - Unified site point queries (`sample_points_over_date_range()`, `sample_points_from_geodataframe()`) onto granule-grouped `/vsicurl/` batch reads.
+- **`v1.2.0`:**
+  - Introduced the global/regional stratified point-sampling engine (`build_stratified_dataset()`, `select_stratified_granules()`, `sample_granule_coordinates()`), vectorized `/vsicurl/` granule sampling (`sample_points_from_granule()`), checkpointed Parquet exports, and expanded `LAYER_MAPPING` to cover `L3T_JET`, `L2T_STARS` UQ priors, `L4T_ESI`, and `L4T_WUE`.
+- **`v1.0.0` – `v1.1.1`:**
+  - Migrated ECOSTRESS CMR search, download, filename parsing, and COG point sampling from Collection 2 to Collection 3 (`.003`), codified LPCLOUD Concept IDs, added `ECOv003-search` / `ECOv003-download` CLIs, and added directory-backed `ECOv003-granules` compatibility handling (`granule_compatibility.py`).
+
+---
+
+## Known Issues
+
+1. **CMR `CloudCover` Field Is Null on Collection 3 Granules:**
+   - NASA CMR does not populate granule-level `CloudCover` metadata for ECOSTRESS Collection 3 products (`ECOSTRESS_CMR_search(..., max_cloud_cover=...)` cannot filter on CMR's `cloud_cover` field). Cloud filtering is instead performed via per-granule `.json` sidecars (`ProductMetadata.QAPercentCloudCover`) in `find_clear_sky_et_granules()` and `build_stratified_dataset()`.
+2. **Local `ECOv003-granules` Compatibility Adapter (`granule_compatibility.py`):**
+   - `ECOv003_CMR/granule_compatibility.py` remains bundled until upstream `ECOv003-granules` incorporates `L1CT_RAD` dispatch, `L3T_ETAUX` support, `L2T_STARS` product parsing, and directory-backed `.tif` file discovery.

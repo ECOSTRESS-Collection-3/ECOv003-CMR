@@ -1,77 +1,146 @@
-# Define the default Python version as a constant
-PYTHON_VERSION = 3.14
-
-.PHONY: dist clean test test-sampler build twine-upload remove-environment install uninstall reinstall environment
-
+# Define the package name, module name, environment name, and Python version
 PACKAGE_NAME = ECOv003-CMR
+MODULE_NAME = $(subst -,_,$(PACKAGE_NAME))
 ENVIRONMENT_NAME = $(PACKAGE_NAME)
-DOCKER_IMAGE_NAME = $(PACKAGE_NAME)
+PYTHON_VERSION = $(if $(PYTHON),$(PYTHON),3.14)
 
-clean:
+# Allow passing extra flags via command line: make <target> ARGS="-k test_name"
+ARGS ?=
+
+# Include a Makefile.local to override things, if found
+-include Makefile.local
+
+.DEFAULT_GOAL := help
+
+.PHONY: help clean environment remove-environment install uninstall reinstall \
+        test test-integration test-sampler \
+        wheel sdist build twine-upload dist \
+        repomix generate-history show-issues show-releases
+
+help: ## Show available targets
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-28s\033[0m %s\n", $$1, $$2}'
+
+##@ Cleanup & Environment
+clean: ## Remove build artifacts, caches, coverage files, and logs
 	rm -rf *.o *.out *.log
 	rm -rf build/
 	rm -rf dist/
 	rm -rf *.egg-info
 	rm -rf .pytest_cache
+	rm -rf htmlcov/ .coverage
+	rm -rf $(PACKAGE_NAME)-repomix.xml repomix-output.xml
 	find . -type d -name "__pycache__" -exec rm -rf {} +
+	find . -type f -name "*.py[co]" -delete
 
-test:
-	pytest tests
-
-test-sampler:
-	rm -rf ./stratified_dataset_test
-	python examples/stratified_sampling_demo.py
-	rm -rf ./stratified_dataset_test
-
-build:
-	python -m build
-
-twine-upload:
-	twine upload dist/*
-
-dist:
-	make clean
-	make build
-	make twine-upload
-
-remove-environment:
-	mamba env remove -y -n $(ENVIRONMENT_NAME)
-
-install:
-	pip install -e .[dev]
-
-uninstall:
-	pip uninstall $(PACKAGE_NAME)
-
-reinstall:
-	make uninstall
-	make install
-
-environment:
+environment: ## Create a new Conda/Mamba environment (override with PYTHON=3.13)
 	mamba create -y -n $(ENVIRONMENT_NAME) -c conda-forge python=$(PYTHON_VERSION)
 	@echo "Python version set to $(PYTHON_VERSION)"
 	@source activate $(ENVIRONMENT_NAME) && python --version
 
-colima-start:
-	colima start -m 16 -a x86_64 -d 100 
+remove-environment: ## Remove the Conda/Mamba environment
+	mamba env remove -y -n $(ENVIRONMENT_NAME)
 
-docker-build:
-	docker build -t $(DOCKER_IMAGE_NAME):latest .
+install: ## Install the package in editable mode with development dependencies
+	pip install -e ".[dev]"
 
-docker-build-environment:
-	docker build --target environment -t $(DOCKER_IMAGE_NAME):latest .
+uninstall: ## Uninstall the package
+	pip uninstall -y $(PACKAGE_NAME)
 
-docker-build-installation:
-	docker build --target installation -t $(DOCKER_IMAGE_NAME):latest .
+reinstall: ## Reinstall the package (uninstall and then install)
+	$(MAKE) uninstall
+	$(MAKE) install
 
-docker-interactive:
-	docker run -it $(DOCKER_IMAGE_NAME) fish 
+##@ Testing & Verification
+test: ## Run Python unit tests using pytest
+	pytest tests -vv -p no:warnings $(ARGS)
 
-docker-remove:
-	docker rmi -f $(DOCKER_IMAGE_NAME)
+test-integration: ## Run live authenticated NASA CMR and LP DAAC integration tests
+	pytest tests -m integration -vv $(ARGS)
 
-repomix:
-	npx repomix --ignore "**/*.ipynb,**/*.csv" --copy
+test-sampler: ## Run live single-tile stratified sampling benchmark
+	rm -rf ./stratified_dataset_test
+	python examples/stratified_sampling_demo.py
+	rm -rf ./stratified_dataset_test
 
-show-releases:
-	gh run list --workflow=python-publish.yml 
+##@ Packaging & Release
+wheel: ## Build the Python wheel
+	python -m build --wheel
+
+sdist: ## Build the Python source distribution
+	python -m build --sdist
+
+build: ## Build the Python wheel and source distribution
+	python -m build
+
+twine-upload: ## Upload the built package to PyPI using Twine
+	twine upload dist/*
+
+dist: ## Clean, build, and upload the package to PyPI
+	$(MAKE) clean
+	$(MAKE) build
+	$(MAKE) twine-upload
+
+##@ Utilities
+repomix: ## Pack repository context for LLM review
+	npx repomix -o $(PACKAGE_NAME)-repomix.xml --ignore "**/*.tif,**/*.jpeg,**/*.aux.xml,**/*.csv,**/*.pdf,**/*.svg,**/*.ipynb,*-repomix*.xml,repomix-output.xml,release_diffs.patch" --copy
+
+generate-history: ## Generate release commit history patch
+	fish -c ' \
+		git fetch --tags --quiet; \
+		set first_commit (git rev-list --max-parents=0 HEAD | head -n 1); \
+		set releases (gh release list --limit 1000 --json tagName,createdAt --jq "sort_by(.createdAt) | .[].tagName"); \
+		begin; \
+			echo "========================================"; \
+			echo "REPOSITORY RELEASE TIMELINE"; \
+			echo "========================================"; \
+			gh release list --limit 1000; \
+			echo ""; \
+			if test (count $$releases) -ge 1; \
+				set first_rel $$releases[1]; \
+				echo "========================================"; \
+				echo "INITIAL COMMIT ($$first_commit) -> FIRST RELEASE ($$first_rel)"; \
+				echo "========================================"; \
+				git log --reverse --stat -p $$first_rel -- "*.py" "pyproject.toml"; \
+				echo ""; \
+			end; \
+			if test (count $$releases) -ge 2; \
+				for i in (seq 2 (count $$releases)); \
+					set prev_idx (math $$i - 1); \
+					set prev $$releases[$$prev_idx]; \
+					set curr $$releases[$$i]; \
+					echo "========================================"; \
+					echo "RELEASE COMMIT HISTORY: $$prev -> $$curr"; \
+					echo "========================================"; \
+					git log --reverse --stat -p $$prev..$$curr -- "*.py" "pyproject.toml"; \
+					echo ""; \
+				end; \
+			end; \
+			if test (count $$releases) -ge 1; \
+				set latest_rel $$releases[-1]; \
+				echo "========================================"; \
+				echo "LATEST RELEASE ($$latest_rel) -> CURRENT WORKING TREE (HEAD + UNCOMMITTED)"; \
+				echo "========================================"; \
+				git log --reverse --stat -p $$latest_rel..HEAD -- "*.py" "pyproject.toml"; \
+				echo ""; \
+				git status -s -- "*.py" "pyproject.toml"; \
+				echo ""; \
+				git diff HEAD -- "*.py" "pyproject.toml"; \
+			else; \
+				echo "========================================"; \
+				echo "INITIAL COMMIT ($$first_commit) -> CURRENT WORKING TREE"; \
+				echo "========================================"; \
+				git log --reverse --stat -p -- "*.py" "pyproject.toml"; \
+				echo ""; \
+				git status -s -- "*.py" "pyproject.toml"; \
+				echo ""; \
+				git diff HEAD -- "*.py" "pyproject.toml"; \
+			end; \
+		end > release_diffs.patch; \
+	'
+
+show-issues: ## List open GitHub issues
+	gh issue list --state open --json number,title,body --template '{{range .}}## #{{.number}}: {{.title}}{{"\n\n"}}{{.body}}{{"\n\n---\n\n"}}{{end}}'
+
+show-releases: ## List recent PyPI publish workflow runs
+	gh run list --workflow=python-publish.yml

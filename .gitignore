@@ -138,3 +138,5 @@ cython_debug/
 data/
 repomix-output.xml
 experimental_data/
+*repomix*
+release_diffs.patch
