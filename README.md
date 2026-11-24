@@ -20,6 +20,8 @@
 10. [Python API: Granule ID, Filename & Tile Utilities](#python-api-granule-id-filename--tile-utilities)
 11. [Examples](#examples)
 12. [Development and Testing](#development-and-testing)
+13. [Version History](#version-history)
+14. [Known Issues](#known-issues)
 
 ---
 
@@ -105,16 +107,32 @@ Installing `ECOv003-CMR` registers two CLI commands: `ECOv003-search` and `ECOv0
 
 ```bash
 # Print matching unique granule IDs to stdout
-ECOv003-search   --product L2T_LSTE L2T_STARS L3T_JET   --tile 52NHN 53NMH   --start-date 2026-06-01   --end-date 2026-06-07
+ECOv003-search \
+  --product L2T_LSTE L2T_STARS L3T_JET \
+  --tile 52NHN 53NMH \
+  --start-date 2026-06-01 \
+  --end-date 2026-06-07
 
 # Filter by orbit/scene/cloud cover and export full file listing to CSV
-ECOv003-search   --product L2T_LSTE   --tile 52NHN   --start-date 2026-06-01   --orbit 44814   --scene 1   --max-cloud-cover 20   --output ecostress-files.csv
+ECOv003-search \
+  --product L2T_LSTE \
+  --tile 52NHN \
+  --start-date 2026-06-01 \
+  --orbit 44814 \
+  --scene 1 \
+  --max-cloud-cover 20 \
+  --output ecostress-files.csv
 ```
 
 ### `ECOv003-download`
 
 ```bash
-ECOv003-download   --product L2T_LSTE L2T_STARS L3T_ETAUX   --tile 11SLT 11SPS   --start-date 2026-06-01   --end-date 2026-06-07   --parent-directory ~/data/ECOSTRESS_v003
+ECOv003-download \
+  --product L2T_LSTE L2T_STARS L3T_ETAUX \
+  --tile 11SLT 11SPS \
+  --start-date 2026-06-01 \
+  --end-date 2026-06-07 \
+  --parent-directory ~/data/ECOSTRESS_v003
 ```
 
 ---
@@ -211,7 +229,7 @@ Point sampling and stratified dataset functions accept any combination of the fo
 `build_stratified_dataset()` scales stratified point-sample dataset generation to global multi-million-sample campaigns (~8.7s–9.6s per granule across 16 science/UQ layers; ~40 minutes amortized for 1,000,000 samples across 4,000 global granules on 16 workers) with:
 - **CMR `granules.csv` Discovery & `POST` Wildcard Resolution:** Enumerates global `L3T_JET` catalogs across 5-day parallel windows (~97% smaller payloads than JSON/UMM-JSON, zero spatial-overlap duplicates) and resolves `.tif` and `.json` asset URLs lazily via `POST` `readable_granule_name[]` batches strictly for selected granules.
 - **Sidecar `QAPercentCloudCover` Filtering & Rejection-Aware Backfill:** Evaluates `max_cloud_cover` concurrently against per-granule `.json` metadata sidecars (`ProductMetadata.QAPercentCloudCover`) and automatically backfills dropped tiles using empirical cloud-rejection multipliers.
-- **A Priori Sampling Design & Dry-Run Mode (`plan_stratified_sampling()`, `estimate_cloud_cover_distribution()`, `dry_run=True`):** Forecasts eligible MGRS tile counts, latitudinal biome representation (`tropical`, `temperate`, `boreal`), effective $N_{	ext{cap}}$, selected granules $G$, per-granule pixel quota $K$, and estimated wall time before reading COGs.
+- **A Priori Sampling Design & Dry-Run Mode (`plan_stratified_sampling()`, `estimate_cloud_cover_distribution()`, `dry_run=True`):** Forecasts eligible MGRS tile counts, latitudinal biome representation (`tropical`, `temperate`, `boreal`), effective $N_{\text{cap}}$, selected granules $G$, per-granule pixel quota $K$, and estimated wall time before reading COGs.
 - **Persistent Candidate Catalog Caching (`catalog_path`, `refresh_catalog`):** Stores SHA-256 cache-keyed `candidate_granules.parquet` catalogs for <0.1s offline restarts.
 - **Bounded HTTP Stream Concurrency (`max_concurrent_streams`, `layer_workers`):** Caps simultaneous `/vsicurl/` connections via a shared `threading.Semaphore`.
 - **Synchronous Batch Cookie Re-Warming (`batch_size`):** Refreshes Netscape URS cookies across synchronous granule batches and cleans up temporary cookie files on exit.
@@ -310,3 +328,44 @@ pytest -m integration -v
 make test-sampler
 make build
 ```
+
+---
+
+## Version History
+
+- **`v1.3.1` (Current Release):**
+  - Replaced `granules.umm_json` sweeps with NASA CMR's lightweight `granules.csv` endpoint across 5-day parallel temporal windows (~97% smaller payloads), enumerating all 348,477 global `L3T_JET` scenes in ~2 minutes.
+  - Switched wildcard `readable_granule_name[]` resolution to HTTP `POST` requests to eliminate `414 Request-URI Too Large` errors on 150-pattern batches.
+  - Removed null CMR `cloud_cover` query parameters and added concurrent `.json` sidecar `ProductMetadata.QAPercentCloudCover` filtering (`filter_granules_by_sidecar_cloud_cover()`, `estimate_cloud_cover_distribution()`) with empirical rejection-aware tile backfill.
+  - Mounted a 64-socket `HTTPAdapter` connection pool in `setup_earthdata_session()` to eliminate `urllib3` pool exhaustion under high thread concurrency.
+  - Added `plan_stratified_sampling()` and `dry_run=True` mode across `build_stratified_dataset()`, `one_hundred_dataset.py`, and `one_million_dataset.py` to forecast biome coverage, $N_{\text{cap}}$, quota $K$, and wall time before reading COGs.
+- **`v1.3.0`:**
+  - Vectorized global land MGRS tile discovery via `sentinel_tiles.sentinel_polygons` (14,749 tiles in 0.62s) and updated `find_sentinel2_tile()` to use true polygon intersection with land filtering.
+  - Added SHA-256 validated `candidate_granules.parquet` caching, bounded `/vsicurl/` HTTP stream concurrency (`max_concurrent_streams`), Netscape URS cookie export (`MozillaCookieJar`) with synchronous `batch_size` re-warming, adaptive per-granule quota refills, and $O(1)$-RAM `pyarrow.parquet` diagnostics in `summarize_point_samples()`.
+  - Unified site point queries (`sample_points_over_date_range()`, `sample_points_from_geodataframe()`) onto granule-grouped `/vsicurl/` batch reads.
+- **`v1.2.0`:**
+  - Introduced the global/regional stratified point-sampling engine (`build_stratified_dataset()`, `select_stratified_granules()`, `sample_granule_coordinates()`), vectorized `/vsicurl/` granule sampling (`sample_points_from_granule()`), checkpointed Parquet exports, and expanded `LAYER_MAPPING` to cover `L3T_JET`, `L2T_STARS` UQ priors, `L4T_ESI`, and `L4T_WUE`.
+- **`v1.0.0` – `v1.1.1`:**
+  - Migrated ECOSTRESS CMR search, download, filename parsing, and COG point sampling from Collection 2 to Collection 3 (`.003`), codified LPCLOUD Concept IDs, added `ECOv003-search` / `ECOv003-download` CLIs, and added directory-backed `ECOv003-granules` compatibility handling (`granule_compatibility.py`).
+- **`v1.4.0` (Planned):**
+  - Hardens `download_file()` with explicit `(connect, read)` socket timeouts, jittered exponential retry backoff, and unconditional `.download` partial file cleanup.
+  - Updates `get_granule_from_listing()` and `download_ECOSTRESS_granule_files()` to select the latest build revision when CMR returns multiple builds of the same granule stem and raise `FileNotFoundError` on empty listings.
+  - Migrates local `granule_compatibility.py` shims upstream into `ECOv003-granules`.
+
+---
+
+## Known Issues
+
+The following known issues exist in `v1.3.1` and are targeted for resolution in `v1.4.0` (see `notes/2026-11-23 ECOv003-CMR timeout issue.md` and `notes/2026-11-23 ECOv003-CMR Development Plan.md`):
+
+1. **Mid-Stream Socket Read Timeouts in Single-File Downloads (`download_file.py`):**
+   - `download_file()` currently issues a single streaming `session.get(...)` request without an explicit `(connect, read)` socket timeout or retry loop. If LP DAAC Earthdata Cloud stalls mid-transfer (`TimeoutError: [Errno 60] Operation timed out`), `ECOSTRESSDownloadFailed` is raised immediately and any non-zero `.download` partial file remains until the next run.
+   - *Workaround:* Re-run `download_ECOSTRESS_granule()` or `download_ECOSTRESS()`; already-completed files in the target granule directory are skipped automatically, and partially downloaded `.download` files are overwritten.
+2. **Multiple Build Revisions Colliding in `download_ECOSTRESS_granule()` (`download_ECOSTRESS_granule_files.py`):**
+   - When NASA CMR returns multiple build revisions (e.g., `_01`, `_02`, `_03`) for the same `(product, orbit, scene, tile, acquisition_date)`, `get_granule_from_listing()` raises `ValueError: there are N found in listing`.
+   - *Workaround:* Search first with `ECOSTRESS_CMR_search()`, filter `CMR_file_listing_df` to the highest `granule` build string, and pass `CMR_file_listing_df=...` to `download_ECOSTRESS_granule()`.
+3. **`AttributeError` on Empty Search Listings in `download_ECOSTRESS_granule()` (`download_ECOSTRESS_granule_files.py`):**
+   - When `ECOSTRESS_CMR_search()` finds zero matching granules and returns an empty columnless `DataFrame`, `get_granule_from_listing()` raises `AttributeError: 'DataFrame' object has no attribute 'granule'` instead of `FileNotFoundError`.
+   - *Workaround:* Verify granule availability with `ECOSTRESS_CMR_search()` (checking `df.empty`) or use `download_ECOSTRESS()`, which returns `[]` when no granules match.
+4. **CMR `CloudCover` Field Is Null on Collection 3 Granules:**
+   - NASA CMR does not populate granule-level `CloudCover` metadata for ECOSTRESS Collection 3 products (`ECOSTRESS_CMR_search(..., max_cloud_cover=...)` cannot filter on CMR's `cloud_cover` field). Cloud filtering is instead performed via per-granule `.json` sidecars (`ProductMetadata.QAPercentCloudCover`) in `find_clear_sky_et_granules()` and `build_stratified_dataset()`.
